@@ -12,7 +12,7 @@ import (
 	"hermes-tele/internal/bot"
 )
 
-var version = "2.0.2"
+var version = "2.0.3"
 
 func main() {
 	configPath := flag.String("config", "config.json", "Path to config JSON file")

@@ -36,6 +36,7 @@ type BotServer struct {
 	userLocks   sync.Map
 	queueMu     sync.Mutex
 	promptQueue map[int64][]QueuedTask
+	aggregator  *MessageAggregator
 }
 
 func NewBotServer(cfg *config.Config, version string) (*BotServer, error) {
@@ -62,6 +63,7 @@ func NewBotServer(cfg *config.Config, version string) (*BotServer, error) {
 		cmdHandler:  cmdHandler,
 		version:     version,
 		promptQueue: make(map[int64][]QueuedTask),
+		aggregator:  NewMessageAggregator(),
 	}
 
 	server.registerCommands()
@@ -161,6 +163,7 @@ func (s *BotServer) handleCallbackQuery(cb *tgbotapi.CallbackQuery) {
 
 	switch {
 	case data == "cancel_task":
+		s.aggregator.Cancel(userID)
 		if s.runner.Stop(userID) {
 			_, _ = EditSafeMessage(s.bot, chatID, cb.Message.MessageID, "🛑 *Tugas telah dibatalkan oleh pengguna.*", nil)
 		}
@@ -222,7 +225,7 @@ func (s *BotServer) handleMessage(msg *tgbotapi.Message) {
 			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 			return
 		}
-		s.executeTask(chatID, userID, prompt, imagePath, "")
+		s.executeTask(chatID, userID, prompt, imagePath, "", 1)
 		return
 	}
 
@@ -232,12 +235,15 @@ func (s *BotServer) handleMessage(msg *tgbotapi.Message) {
 
 	// 2. Handle slash commands
 	if strings.HasPrefix(text, "/") {
+		s.aggregator.Cancel(userID)
 		s.dispatchCommand(msg, text)
 		return
 	}
 
-	// 3. Regular chat prompt execution
-	s.executeTask(chatID, userID, text, "", "")
+	// 3. Regular chat prompt execution via MessageAggregator (auto-stitches Telegram 4096-char split chunks)
+	s.aggregator.Add(msg, func(cID, uID int64, prompt, img, skills string, partsCount int) {
+		s.executeTask(cID, uID, prompt, img, skills, partsCount)
+	})
 }
 
 func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
@@ -308,6 +314,7 @@ func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
 	case "/version":
 		s.cmdHandler.HandleVersion(s.bot, chatID)
 	case "/stop":
+		s.aggregator.Cancel(userID)
 		s.cmdHandler.HandleStop(s.bot, chatID, userID)
 	case "/logs":
 		s.cmdHandler.HandleLogs(s.bot, chatID)
@@ -325,9 +332,9 @@ func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
 		}
 
 		if arg != "" {
-			s.executeTask(chatID, userID, arg, "", skillName)
+			s.executeTask(chatID, userID, arg, "", skillName, 1)
 		} else {
-			s.executeTask(chatID, userID, fmt.Sprintf("Gunakan skill %s untuk membantu tugas berikutnya.", skillName), "", skillName)
+			s.executeTask(chatID, userID, fmt.Sprintf("Gunakan skill %s untuk membantu tugas berikutnya.", skillName), "", skillName, 1)
 		}
 	}
 }
@@ -414,7 +421,7 @@ func (s *BotServer) handleRetryCommand(chatID, userID int64, arg string) {
 	sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("🔄 *Mengulang tugas sebelumnya:*\n`%s`", truncate(promptToRun, 80)), nil)
 	s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 
-	go s.executeTask(chatID, userID, promptToRun, lastImg, "")
+	go s.executeTask(chatID, userID, promptToRun, lastImg, "", 1)
 }
 
 func (s *BotServer) handleUndoCommand(chatID, userID int64) {
@@ -471,7 +478,7 @@ func skillExists(skillsDir, skillName string) bool {
 	return false
 }
 
-func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preloadSkills string) {
+func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preloadSkills string, partsCount int) {
 	lockIface, _ := s.userLocks.LoadOrStore(userID, &sync.Mutex{})
 	lock := lockIface.(*sync.Mutex)
 
@@ -484,7 +491,7 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 			s.runner.Stop(userID)
 			go func() {
 				time.Sleep(600 * time.Millisecond)
-				s.executeTask(chatID, userID, prompt, imagePath, preloadSkills)
+				s.executeTask(chatID, userID, prompt, imagePath, preloadSkills, partsCount)
 			}()
 			return
 		}
@@ -509,7 +516,13 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 	s.sessMgr.SetLastPrompt(userID, prompt, imagePath)
 
 	cancelKb := CancelKeyboard()
-	statusMsg, err := SendSafeMessage(s.bot, chatID, "🌸 *Aida sedang menjalankan tugas...*\n\n💭 _Sedang berpikir & menganalisis instruksi..._", cancelKb)
+	var statusText string
+	if partsCount > 1 {
+		statusText = fmt.Sprintf("🌸 *Aida sedang menjalankan tugas...*\n_📦 Menggabungkan %d potongan pesan menjadi 1 prompt utuh (%d karakter)_\n\n💭 _Sedang menganalisis instruksi..._", partsCount, len([]rune(prompt)))
+	} else {
+		statusText = "🌸 *Aida sedang menjalankan tugas...*\n\n💭 _Sedang berpikir & menganalisis instruksi..._"
+	}
+	statusMsg, err := SendSafeMessage(s.bot, chatID, statusText, cancelKb)
 	hasStatusMsg := (err == nil)
 	if hasStatusMsg {
 		s.sessMgr.AddTelegramMsgID(userID, statusMsg.MessageID)
@@ -621,7 +634,7 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 func (s *BotServer) checkAndRunNextQueuedTask(userID int64) {
 	if next := s.popNextTask(userID); next != nil {
 		log.Printf("[bot] Running next queued task for User %d: %q", userID, next.Prompt)
-		go s.executeTask(next.ChatID, next.UserID, next.Prompt, next.ImagePath, next.PreloadSkills)
+		go s.executeTask(next.ChatID, next.UserID, next.Prompt, next.ImagePath, next.PreloadSkills, 1)
 	}
 }
 

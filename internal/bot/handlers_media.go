@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -106,6 +107,20 @@ func ProcessMediaMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, mediaDir s
 			return "", "", fmt.Errorf("gagal mengunduh dokumen: %w", err)
 		}
 
+		// If the document is a readable plain text file (< 2MB), embed content directly into prompt
+		ext := strings.ToLower(filepath.Ext(fileName))
+		isTextFile := isTextExtension(ext) || strings.HasPrefix(msg.Document.MimeType, "text/")
+		if isTextFile && msg.Document.FileSize < 2*1024*1024 {
+			if content, readErr := os.ReadFile(savePath); readErr == nil && len(content) > 0 {
+				docPrompt := fmt.Sprintf("Pengguna mengirim file dokumen `%s` (tersimpan di `%s`).\n\nIsi file:\n```\n%s\n```",
+					fileName, savePath, string(content))
+				if caption != "" {
+					docPrompt += "\n\nInstruksi pengguna: " + caption
+				}
+				return docPrompt, "", nil
+			}
+		}
+
 		userPrompt := fmt.Sprintf("Pengguna mengirim dokumen `%s` yang tersimpan di: `%s`.\nBaca dan analisis dokumen ini.", fileName, savePath)
 		if caption != "" {
 			userPrompt += "\nInstruksi tambahan: " + caption
@@ -114,4 +129,15 @@ func ProcessMediaMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, mediaDir s
 	}
 
 	return "", "", fmt.Errorf("pesan tidak mengandung media yang didukung")
+}
+
+func isTextExtension(ext string) bool {
+	switch ext {
+	case ".txt", ".md", ".json", ".py", ".go", ".js", ".ts", ".jsx", ".tsx",
+		".csv", ".log", ".sh", ".bash", ".yaml", ".yml", ".xml", ".html",
+		".css", ".sql", ".env", ".toml", ".ini", ".conf", ".cfg":
+		return true
+	default:
+		return false
+	}
 }

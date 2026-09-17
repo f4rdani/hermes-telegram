@@ -182,18 +182,23 @@ func (s *BotServer) handleCallbackQuery(cb *tgbotapi.CallbackQuery) {
 		text := fmt.Sprintf("✅ *Tingkat Penalaran Diubah*\n\nPengaturan aktif: `%s`", strings.ToUpper(effort))
 		_, _ = EditSafeMessage(s.bot, chatID, cb.Message.MessageID, text, &kb)
 
+	case data == "dismiss_msg" || data == "delete_msg":
+		del := tgbotapi.NewDeleteMessage(chatID, cb.Message.MessageID)
+		_, _ = s.bot.Send(del)
+		return
+
 	case strings.HasPrefix(data, "resume_session:"):
 		sessionID := strings.TrimPrefix(data, "resume_session:")
 		s.sessMgr.SetSessionID(userID, sessionID)
+		dismissKb := DismissKeyboard()
 		text := fmt.Sprintf("✅ *Sesi Berhasil Dialihkan*\n\nSesi aktif saat ini: `%s`", sessionID)
-		sent, _ := SendSafeMessage(s.bot, chatID, text, nil)
-		s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+		_, _ = EditSafeMessage(s.bot, chatID, cb.Message.MessageID, text, &dismissKb)
 
 	case data == "new_session":
 		s.sessMgr.ResetSession(userID)
+		dismissKb := DismissKeyboard()
 		text := "✨ *Sesi Baru Disiapkan*\n\nKirim pesan untuk memulai percakapan baru dengan Aida."
-		sent, _ := SendSafeMessage(s.bot, chatID, text, nil)
-		s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+		_, _ = EditSafeMessage(s.bot, chatID, cb.Message.MessageID, text, &dismissKb)
 
 	case strings.HasPrefix(data, "cmd_page:"):
 		pageStr := strings.TrimPrefix(data, "cmd_page:")

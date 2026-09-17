@@ -59,7 +59,8 @@ func (h *CommandHandler) HandleStart(bot *tgbotapi.BotAPI, chatID, userID int64)
 		s.CurrentModel, s.ReasoningEffort, s.YoloMode, h.cfg.Hermes.WorkingDir, sessionInfo,
 	)
 
-	_, _ = SendSafeMessage(bot, chatID, reply, nil)
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
 }
 
 func (h *CommandHandler) HandleHelp(bot *tgbotapi.BotAPI, chatID, userID int64, query string) {
@@ -91,7 +92,8 @@ func (h *CommandHandler) HandleHelp(bot *tgbotapi.BotAPI, chatID, userID int64, 
 			"• `/reload_mcp` - Muat ulang konfigurasi MCP server\n" +
 			"• `/commands` - Menu interaktif seluruh 100+ perintah"
 
-		_, _ = SendSafeMessage(bot, chatID, reply, nil)
+		dismissKb := DismissKeyboard()
+		_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
 		return
 	}
 
@@ -143,23 +145,33 @@ func (h *CommandHandler) HandleCommands(bot *tgbotapi.BotAPI, chatID int64, page
 func (h *CommandHandler) HandleStatus(bot *tgbotapi.BotAPI, chatID, userID int64) {
 	s := h.sessMgr.Get(userID, chatID)
 
-	// 1. RAM info
+	// 1. RAM & Swap info (Cleanly formatted)
 	ramInfo := "Tidak tersedia"
 	out, err := exec.Command("free", "-h").Output()
 	if err == nil {
-		lines := strings.Split(string(out), "\n")
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 		if len(lines) >= 3 {
-			ramInfo = fmt.Sprintf("Mem: %s\n  Swap: %s", lines[1], lines[2])
-		} else if len(lines) >= 2 {
-			ramInfo = lines[1]
+			memFields := strings.Fields(lines[1])
+			swapFields := strings.Fields(lines[2])
+			if len(memFields) >= 7 && len(swapFields) >= 3 {
+				ramInfo = fmt.Sprintf("• *RAM:* %s terpakai / %s _(Tersedia: %s)_\n• *Swap:* %s terpakai / %s",
+					memFields[2], memFields[1], memFields[6], swapFields[2], swapFields[1])
+			} else if len(memFields) >= 3 {
+				ramInfo = fmt.Sprintf("• *RAM:* %s terpakai / %s", memFields[2], memFields[1])
+			}
 		}
 	}
 
-	// 2. 9router ping
-	routerStatus := "🟢 Online (localhost:20128)"
-	client := http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get("http://localhost:20128/v1/models")
-	if err != nil || (resp != nil && resp.StatusCode != http.StatusOK) {
+	// 2. 9router ping (Instant check on 127.0.0.1:20128 without slow upstream probe)
+	routerStatus := "🟢 Online (:20128)"
+	client := http.Client{
+		Timeout: 1 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Get("http://127.0.0.1:20128/")
+	if err != nil || (resp != nil && resp.StatusCode >= 500) {
 		routerStatus = "🔴 Offline / Bermasalah"
 	}
 	if resp != nil {
@@ -167,22 +179,26 @@ func (h *CommandHandler) HandleStatus(bot *tgbotapi.BotAPI, chatID, userID int64
 	}
 
 	// 3. Camofox ping
-	camofoxStatus := "💤 Idle / Sleep (Auto-wake on demand :9377)"
-	respCam, errCam := client.Get("http://localhost:9377")
+	camofoxStatus := "💤 Idle / Sleep (:9377)"
+	respCam, errCam := client.Get("http://127.0.0.1:9377")
 	if errCam == nil && respCam != nil {
 		camofoxStatus = "🟢 Active (:9377)"
 		_ = respCam.Body.Close()
 	}
 
-	// 4. Session tokens
-	sessionDetails := "Belum ada riwayat"
+	// 4. Current session details
+	sessionDetails := "✨ *Sesi Baru* _(Kirim pesan untuk memulai percakapan baru)_"
 	if s.CurrentSessionID != "" {
 		det, err := h.sessMgr.GetSessionDetails(s.CurrentSessionID)
 		if err == nil && det != nil {
-			sessionDetails = fmt.Sprintf("ID: `%s`\nPesan: %d | Tokens: In %d / Out %d",
-				det.ID, det.MessageCount, det.InputTokens, det.OutputTokens)
+			title := det.Title
+			if title == "" {
+				title = "Tanpa Judul"
+			}
+			sessionDetails = fmt.Sprintf("🟢 `%s`\n   📌 *%s*\n   💬 %d pesan | 🪙 In %d / Out %d",
+				det.ID, title, det.MessageCount, det.InputTokens, det.OutputTokens)
 		} else {
-			sessionDetails = fmt.Sprintf("ID: `%s`", s.CurrentSessionID)
+			sessionDetails = fmt.Sprintf("🟢 `%s`", s.CurrentSessionID)
 		}
 	}
 
@@ -190,7 +206,7 @@ func (h *CommandHandler) HandleStatus(bot *tgbotapi.BotAPI, chatID, userID int64
 
 	reply := fmt.Sprintf(
 		"📊 *Status Sistem Hermes Agent Gateway*\n\n"+
-			"🖥️ *Server & Memori:*\n```\n%s\n```\n"+
+			"🖥️ *Server & Memori:*\n%s\n\n"+
 			"🤖 *Hermes Gateway:* `v%s (Go Native)`\n"+
 			"⏱️ *Gateway Uptime:* `%v`\n"+
 			"🧠 *Model Default:* `%s`\n"+
@@ -204,19 +220,22 @@ func (h *CommandHandler) HandleStatus(bot *tgbotapi.BotAPI, chatID, userID int64
 		routerStatus, camofoxStatus, sessionDetails,
 	)
 
-	_, _ = SendSafeMessage(bot, chatID, reply, nil)
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
 }
 
 func (h *CommandHandler) HandleContext(bot *tgbotapi.BotAPI, chatID, userID int64) {
 	s := h.sessMgr.Get(userID, chatID)
 	if s.CurrentSessionID == "" {
-		_, _ = SendSafeMessage(bot, chatID, "ℹ️ Belum ada sesi percakapan aktif. Kirim pesan untuk membuat sesi baru.", nil)
+		dismissKb := DismissKeyboard()
+		_, _ = SendSafeMessage(bot, chatID, "ℹ️ Belum ada sesi percakapan aktif. Kirim pesan untuk membuat sesi baru.", dismissKb)
 		return
 	}
 
 	det, err := h.sessMgr.GetSessionDetails(s.CurrentSessionID)
 	if err != nil || det == nil {
-		_, _ = SendSafeMessage(bot, chatID, fmt.Sprintf("ℹ️ Sesi `%s` belum memiliki statistik token di database.", s.CurrentSessionID), nil)
+		dismissKb := DismissKeyboard()
+		_, _ = SendSafeMessage(bot, chatID, fmt.Sprintf("ℹ️ Sesi `%s` belum memiliki statistik token di database.", s.CurrentSessionID), dismissKb)
 		return
 	}
 
@@ -249,7 +268,8 @@ func (h *CommandHandler) HandleContext(bot *tgbotapi.BotAPI, chatID, userID int6
 		det.LastActivity.Format("15:04:05 02-Jan-2006"),
 	)
 
-	_, _ = SendSafeMessage(bot, chatID, reply, nil)
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
 }
 
 func (h *CommandHandler) HandleModel(bot *tgbotapi.BotAPI, chatID, userID int64, modelArg string) {
@@ -287,29 +307,53 @@ func (h *CommandHandler) HandleReasoning(bot *tgbotapi.BotAPI, chatID, userID in
 func (h *CommandHandler) HandleNew(bot *tgbotapi.BotAPI, chatID, userID int64) {
 	h.sessMgr.ResetSession(userID)
 	reply := "✨ *Sesi Baru Disiapkan*\n\nKonteks sesi lama telah direset. Pesan berikutnya yang Anda kirim akan otomatis membuat sesi percakapan baru di Hermes Agent."
-	_, _ = SendSafeMessage(bot, chatID, reply, nil)
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
 }
 
 func (h *CommandHandler) HandleSessions(bot *tgbotapi.BotAPI, chatID, userID int64) {
 	s := h.sessMgr.Get(userID, chatID)
 	sessions, err := h.sessMgr.ListHermesSessions(8)
 	if err != nil || len(sessions) == 0 {
-		_, _ = SendSafeMessage(bot, chatID, "ℹ️ Belum ada sesi yang tersimpan dalam database.", nil)
+		dismissKb := DismissKeyboard()
+		_, _ = SendSafeMessage(bot, chatID, "ℹ️ Belum ada sesi yang tersimpan dalam database.", dismissKb)
 		return
 	}
 
 	var sb strings.Builder
-	sb.WriteString("📚 *Daftar Sesi Hermes Terbaru:*\n\n")
+	sb.WriteString("📚 *Daftar Sesi Hermes Terbaru*\n\n")
+
+	// Header displaying current active session clearly
+	if s.CurrentSessionID != "" {
+		activeTitle := ""
+		for _, sess := range sessions {
+			if sess.ID == s.CurrentSessionID {
+				activeTitle = sess.Title
+				break
+			}
+		}
+		if activeTitle != "" {
+			sb.WriteString(fmt.Sprintf("🟢 *Sesi Aktif Saat Ini:*\n`%s` — _%s_\n\n", s.CurrentSessionID, activeTitle))
+		} else {
+			sb.WriteString(fmt.Sprintf("🟢 *Sesi Aktif Saat Ini:*\n`%s`\n\n", s.CurrentSessionID))
+		}
+	} else {
+		sb.WriteString("✨ *Sesi Aktif Saat Ini:*\n_Sesi Baru (Belum ada riwayat aktif, kirim pesan untuk memulai)_\n\n")
+	}
+
+	sb.WriteString("📋 *Riwayat Sesi Sebelumnya:*\n")
 	for i, sess := range sessions {
 		mark := "▫️"
+		statusBadge := ""
 		if sess.ID == s.CurrentSessionID {
-			mark = "⭐️ *(Aktif)*"
+			mark = "🟢"
+			statusBadge = " *(Sedang Aktif)*"
 		}
-		sb.WriteString(fmt.Sprintf("%d. %s `%s`\n   📌 *%s*\n   💬 %d pesan | ⏱ %s\n\n",
-			i+1, mark, sess.ID, sess.Title, sess.MessageCount, sess.LastActivity.Format("15:04 02/01"),
+		sb.WriteString(fmt.Sprintf("%d. %s `%s`%s\n   📌 *%s*\n   💬 %d pesan | ⏱ %s\n\n",
+			i+1, mark, sess.ID, statusBadge, sess.Title, sess.MessageCount, sess.LastActivity.Format("15:04 02/01"),
 		))
 	}
-	sb.WriteString("Klik salah satu tombol di bawah untuk langsung beralih ke sesi tersebut:")
+	sb.WriteString("Pilih salah satu tombol di bawah untuk beralih ke sesi tersebut:")
 
 	kb := SessionsKeyboard(sessions, s.CurrentSessionID)
 	_, _ = SendSafeMessage(bot, chatID, sb.String(), kb)
@@ -324,7 +368,8 @@ func (h *CommandHandler) HandleResume(bot *tgbotapi.BotAPI, chatID, userID int64
 
 	h.sessMgr.SetSessionID(userID, sessionID)
 	reply := fmt.Sprintf("✅ *Sesi Berhasil Dialihkan*\n\nSesi aktif sekarang: `%s`\nPercakapan selanjutnya akan melanjutkan riwayat sesi ini.", sessionID)
-	_, _ = SendSafeMessage(bot, chatID, reply, nil)
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
 }
 
 func (h *CommandHandler) HandleTitle(bot *tgbotapi.BotAPI, chatID, userID int64, newTitle string) {

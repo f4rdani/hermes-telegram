@@ -8,6 +8,16 @@ import (
 	"hermes-tele/internal/session"
 )
 
+func DismissButton() tgbotapi.InlineKeyboardButton {
+	return tgbotapi.NewInlineKeyboardButtonData("🗑️ Tutup", "dismiss_msg")
+}
+
+func DismissKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(DismissButton()),
+	)
+}
+
 func CancelKeyboard() tgbotapi.InlineKeyboardMarkup {
 	btn := tgbotapi.NewInlineKeyboardButtonData("🛑 Batalkan Tugas", "cancel_task")
 	return tgbotapi.NewInlineKeyboardMarkup(
@@ -36,6 +46,7 @@ func ModelKeyboard(currentModel string) tgbotapi.InlineKeyboardMarkup {
 		btn := tgbotapi.NewInlineKeyboardButtonData(label, "set_model:"+m.Name)
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(btn))
 	}
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(DismissButton()))
 	return tgbotapi.InlineKeyboardMarkup{InlineKeyboard: rows}
 }
 
@@ -49,28 +60,32 @@ func ReasoningKeyboard(currentEffort string) tgbotapi.InlineKeyboardMarkup {
 		}
 		buttons = append(buttons, tgbotapi.NewInlineKeyboardButtonData(label, "set_reasoning:"+e))
 	}
-	return tgbotapi.NewInlineKeyboardMarkup(buttons)
+	return tgbotapi.NewInlineKeyboardMarkup(
+		buttons,
+		[]tgbotapi.InlineKeyboardButton{DismissButton()},
+	)
 }
 
 func SessionsKeyboard(sessions []session.SessionSummary, currentID string) tgbotapi.InlineKeyboardMarkup {
 	var rows [][]tgbotapi.InlineKeyboardButton
 
-	for _, s := range sessions {
-		prefix := "▫️"
+	for i, s := range sessions {
+		prefix := fmt.Sprintf("%d. ▫️", i+1)
 		if s.ID == currentID {
-			prefix = "⭐️"
+			prefix = fmt.Sprintf("%d. 🟢", i+1)
 		}
 		title := s.Title
-		if len([]rune(title)) > 24 {
-			title = string([]rune(title)[:24]) + "…"
+		if len([]rune(title)) > 20 {
+			title = string([]rune(title)[:20]) + "…"
 		}
-		btnText := fmt.Sprintf("%s %s (%s)", prefix, title, s.ID[len(s.ID)-6:])
+		btnText := fmt.Sprintf("%s %s", prefix, title)
 		btn := tgbotapi.NewInlineKeyboardButtonData(btnText, "resume_session:"+s.ID)
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(btn))
 	}
 
 	newSessionBtn := tgbotapi.NewInlineKeyboardButtonData("✨ Buat Sesi Baru", "new_session")
-	rows = append(rows, tgbotapi.NewInlineKeyboardRow(newSessionBtn))
+	closeBtn := DismissButton()
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(newSessionBtn, closeBtn))
 
 	return tgbotapi.InlineKeyboardMarkup{InlineKeyboard: rows}
 }
@@ -84,7 +99,10 @@ func CommandsPaginationKeyboard(page, totalPages int) tgbotapi.InlineKeyboardMar
 	if page < totalPages {
 		row = append(row, tgbotapi.NewInlineKeyboardButtonData("Berikutnya ➡", fmt.Sprintf("cmd_page:%d", page+1)))
 	}
-	return tgbotapi.NewInlineKeyboardMarkup(row)
+	return tgbotapi.NewInlineKeyboardMarkup(
+		row,
+		[]tgbotapi.InlineKeyboardButton{DismissButton()},
+	)
 }
 
 func ApprovalKeyboard(actionID string) tgbotapi.InlineKeyboardMarkup {

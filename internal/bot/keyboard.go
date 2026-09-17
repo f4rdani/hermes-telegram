@@ -9,7 +9,7 @@ import (
 )
 
 func DismissButton() tgbotapi.InlineKeyboardButton {
-	return tgbotapi.NewInlineKeyboardButtonData("🗑️ Tutup", "dismiss_msg")
+	return tgbotapi.NewInlineKeyboardButtonData("✖️ Batal / Tutup", "dismiss_msg")
 }
 
 func DismissKeyboard() tgbotapi.InlineKeyboardMarkup {

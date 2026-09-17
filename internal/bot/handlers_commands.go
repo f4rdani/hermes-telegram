@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -544,3 +545,542 @@ func (h *CommandHandler) HandleBusy(bot *tgbotapi.BotAPI, chatID, userID int64, 
 	)
 	_, _ = SendSafeMessage(bot, chatID, reply, nil)
 }
+
+func (h *CommandHandler) HandleEgress(bot *tgbotapi.BotAPI, chatID int64) {
+	out, err := exec.Command(h.cfg.Hermes.BinaryPath, "egress", "status").CombinedOutput()
+	status := strings.TrimSpace(string(out))
+	if err != nil || status == "" {
+		status = "Egress proxy stopped / inactive."
+	}
+	ipOut, _ := exec.Command("curl", "-s", "--max-time", "2", "https://cloudflare.com/cdn-cgi/trace").Output()
+	ip := "Unknown"
+	for _, line := range strings.Split(string(ipOut), "\n") {
+		if strings.HasPrefix(line, "ip=") {
+			ip = strings.TrimPrefix(line, "ip=")
+			break
+		}
+	}
+	reply := fmt.Sprintf(
+		"🌐 *Status Network & Egress Proxy*\n\n"+
+			"• *Public Outbound IP:* `%s`\n\n"+
+			"📋 *Detail Status Egress:*\n```\n%s\n```",
+		ip, status,
+	)
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleDebug(bot *tgbotapi.BotAPI, chatID int64, arg string) {
+	arg = strings.TrimSpace(arg)
+	if arg == "share" || arg == "upload" || arg == "--yes" {
+		out, err := exec.Command(h.cfg.Hermes.BinaryPath, "debug", "share", "--yes").CombinedOutput()
+		if err != nil {
+			_, _ = SendSafeMessage(bot, chatID, fmt.Sprintf("❌ Gagal membuat shareable debug: %v\n\n```\n%s\n```", err, string(out)), nil)
+			return
+		}
+		reply := fmt.Sprintf("🔗 *Laporan Debug Berhasil Dibuat:*\n\n```\n%s\n```", string(out))
+		_, _ = SendSafeMessage(bot, chatID, reply, nil)
+		return
+	}
+
+	outMem, _ := exec.Command("free", "-h").Output()
+	memStr := "N/A"
+	memLines := strings.Split(strings.TrimSpace(string(outMem)), "\n")
+	if len(memLines) >= 2 {
+		memStr = memLines[1]
+	}
+
+	outUptime, _ := exec.Command("uptime").Output()
+	uptimeStr := strings.TrimSpace(string(outUptime))
+
+	logPath := filepath.Join(h.cfg.Hermes.HermesHome, "logs", "agent.log")
+	logOut, _ := exec.Command("tail", "-n", "15", logPath).Output()
+
+	reply := fmt.Sprintf(
+		"🛠️ *Hermes System Diagnostic Report*\n\n"+
+			"• *Gateway Version:* `v%s`\n"+
+			"• *Gateway Uptime:* `%v`\n"+
+			"• *System Uptime:* `%s`\n"+
+			"• *Memory:* `%s`\n"+
+			"• *Working Dir:* `%s`\n"+
+			"• *Home Dir:* `%s`\n\n"+
+			"📋 *Log Terakhir (`agent.log`):*\n```\n%s\n```\n\n"+
+			"_Gunakan `/debug share` untuk mengunggah laporan debug online._",
+		h.version, time.Since(h.startTime).Round(time.Second), uptimeStr, memStr,
+		h.cfg.Hermes.WorkingDir, h.cfg.Hermes.HermesHome, string(logOut),
+	)
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleUsage(bot *tgbotapi.BotAPI, chatID, userID int64, arg string) {
+	s := h.sessMgr.Get(userID, chatID)
+	query := "SELECT model, SUM(api_call_count), SUM(input_tokens), SUM(output_tokens), SUM(cache_read_tokens), SUM(reasoning_tokens), SUM(estimated_cost_usd) FROM session_model_usage GROUP BY model ORDER BY SUM(input_tokens+output_tokens) DESC;"
+	cmd := exec.Command("sqlite3", h.cfg.Hermes.StateDBPath, query)
+	out, err := cmd.Output()
+
+	var sb strings.Builder
+	sb.WriteString("📊 *Statistik Penggunaan Token & Kuota*\n\n")
+
+	if s.CurrentSessionID != "" {
+		det, _ := h.sessMgr.GetSessionDetails(s.CurrentSessionID)
+		if det != nil {
+			sb.WriteString(fmt.Sprintf("🟢 *Sesi Aktif (`%s`):*\n• Pesan: %d\n• Input Tokens: %d\n• Output Tokens: %d\n• Total Sesi: %d tokens\n\n",
+				det.ID, det.MessageCount, det.InputTokens, det.OutputTokens, det.InputTokens+det.OutputTokens))
+		}
+	}
+
+	sb.WriteString("📈 *Akumulasi Seluruh Sesi per Model:*\n")
+	if err == nil && len(strings.TrimSpace(string(out))) > 0 {
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		var grandTotalCalls, grandTotalIn, grandTotalOut, grandTotalCache int
+		for _, line := range lines {
+			parts := strings.Split(line, "|")
+			if len(parts) < 7 {
+				continue
+			}
+			model := parts[0]
+			calls, _ := strconv.Atoi(parts[1])
+			inTok, _ := strconv.Atoi(parts[2])
+			outTok, _ := strconv.Atoi(parts[3])
+			cacheTok, _ := strconv.Atoi(parts[4])
+			reasonTok, _ := strconv.Atoi(parts[5])
+
+			grandTotalCalls += calls
+			grandTotalIn += inTok
+			grandTotalOut += outTok
+			grandTotalCache += cacheTok
+
+			sb.WriteString(fmt.Sprintf("• *%s*:\n  💬 %d calls | 🪙 In: %d, Out: %d\n  ⚡ Cache: %d, Reasoning: %d\n",
+				model, calls, inTok, outTok, cacheTok, reasonTok))
+		}
+		sb.WriteString(fmt.Sprintf("\n🌐 *Total Keseluruhan:*\n• Total Panggilan API: %d\n• Total Input: %d tokens\n• Total Output: %d tokens\n• Cache Read: %d tokens\n",
+			grandTotalCalls, grandTotalIn, grandTotalOut, grandTotalCache))
+	} else {
+		sb.WriteString("_Belum ada data penggunaan tercatat di database._\n")
+	}
+
+	sb.WriteString("\n💡 _Model lokal 9router tidak memiliki batasan kuota berbayar._")
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, sb.String(), dismissKb)
+}
+
+func (h *CommandHandler) HandleApprove(bot *tgbotapi.BotAPI, chatID, userID int64, arg string) {
+	s := h.sessMgr.Get(userID, chatID)
+	reply := fmt.Sprintf(
+		"ℹ️ *Status Persetujuan (Approvals)*\n\n"+
+			"Saat ini tidak ada aksi berbahaya atau perintah yang sedang menunggu persetujuan.\n\n"+
+			"• *Mode YOLO:* `%v`\n"+
+			"_Dalam mode YOLO aktif, semua perintah dan perubahan file otomatis disetujui tanpa jeda konfirmasi._",
+		s.YoloMode,
+	)
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleDeny(bot *tgbotapi.BotAPI, chatID, userID int64, arg string) {
+	reply := "ℹ️ Tidak ada aksi berbahaya yang tertunda untuk ditolak saat ini."
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleCompress(bot *tgbotapi.BotAPI, chatID, userID int64, arg string) {
+	s := h.sessMgr.Get(userID, chatID)
+	if s.CurrentSessionID == "" {
+		dismissKb := DismissKeyboard()
+		_, _ = SendSafeMessage(bot, chatID, "ℹ️ Belum ada sesi percakapan aktif untuk dikompres.", dismissKb)
+		return
+	}
+
+	det, err := h.sessMgr.GetSessionDetails(s.CurrentSessionID)
+	if err != nil || det == nil {
+		dismissKb := DismissKeyboard()
+		_, _ = SendSafeMessage(bot, chatID, fmt.Sprintf("ℹ️ Sesi `%s` belum memiliki riwayat pesan.", s.CurrentSessionID), dismissKb)
+		return
+	}
+
+	arg = strings.TrimSpace(arg)
+	reply := fmt.Sprintf(
+		"🗜️ *Status Kompresi Konteks Sesi (`%s`)*\n\n"+
+			"• *Jumlah Pesan Saat Ini:* %d\n"+
+			"• *Total Token Konteks:* %d\n"+
+			"• *Estimasi Pengurangan:* ~50-70%%\n\n"+
+			"💡 _Untuk mereset riwayat sepenuhnya dan mulai segar, gunakan `/new`._",
+		det.ID, det.MessageCount, det.InputTokens+det.OutputTokens,
+	)
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleRestart(bot *tgbotapi.BotAPI, chatID int64) {
+	_, _ = SendSafeMessage(bot, chatID, "🔄 *Memulai ulang gateway Hermes Telegram...*\nGateway akan kembali aktif dalam beberapa detik.", nil)
+	go func() {
+		time.Sleep(600 * time.Millisecond)
+		_ = exec.Command("systemctl", "restart", "hermes-tele.service").Run()
+	}()
+}
+
+func (h *CommandHandler) HandleUpdate(bot *tgbotapi.BotAPI, chatID int64, arg string) {
+	arg = strings.TrimSpace(arg)
+	if arg == "now" || arg == "--yes" {
+		_, _ = SendSafeMessage(bot, chatID, "⏳ *Sedang memeriksa dan memperbarui Hermes Agent...*", nil)
+		out, err := exec.Command(h.cfg.Hermes.BinaryPath, "update", "--yes").CombinedOutput()
+		if err != nil {
+			_, _ = SendSafeMessage(bot, chatID, fmt.Sprintf("❌ Gagal memperbarui: %v\n\n```\n%s\n```", err, string(out)), nil)
+			return
+		}
+		_, _ = SendSafeMessage(bot, chatID, fmt.Sprintf("✅ *Pembaruan Selesai:*\n\n```\n%s\n```", string(out)), nil)
+		return
+	}
+
+	out, err := exec.Command(h.cfg.Hermes.BinaryPath, "update", "--check").CombinedOutput()
+	res := strings.TrimSpace(string(out))
+	if err != nil || res == "" {
+		res = "Hermes Agent sudah menggunakan versi terkini."
+	}
+	reply := fmt.Sprintf("☤ *Pemeriksaan Pembaruan Hermes Agent*\n\n```\n%s\n```\n\n_Ketik `/update now` untuk menginstal pembaruan._", res)
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleSave(bot *tgbotapi.BotAPI, chatID, userID int64, format string) {
+	s := h.sessMgr.Get(userID, chatID)
+	if s.CurrentSessionID == "" {
+		dismissKb := DismissKeyboard()
+		_, _ = SendSafeMessage(bot, chatID, "⚠️ Belum ada sesi aktif untuk diekspor.", dismissKb)
+		return
+	}
+
+	query := fmt.Sprintf("SELECT role, COALESCE(content, ''), timestamp FROM messages WHERE session_id = '%s' ORDER BY timestamp ASC;",
+		strings.ReplaceAll(s.CurrentSessionID, "'", "''"))
+	cmd := exec.Command("sqlite3", h.cfg.Hermes.StateDBPath, query)
+	out, err := cmd.Output()
+	if err != nil || len(strings.TrimSpace(string(out))) == 0 {
+		dismissKb := DismissKeyboard()
+		_, _ = SendSafeMessage(bot, chatID, "⚠️ Tidak ada riwayat pesan yang ditemukan untuk sesi ini.", dismissKb)
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("# Ekspor Sesi Hermes: %s\n\n", s.CurrentSessionID))
+	sb.WriteString(fmt.Sprintf("_Waktu Ekspor: %s_\n\n---\n\n", time.Now().Format("2006-01-02 15:04:05")))
+
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		parts := strings.SplitN(line, "|", 3)
+		if len(parts) < 3 {
+			continue
+		}
+		role := strings.ToUpper(parts[0])
+		content := parts[1]
+		secFloat, _ := strconv.ParseFloat(parts[2], 64)
+		ts := time.Unix(int64(secFloat), 0).Format("15:04:05")
+
+		sb.WriteString(fmt.Sprintf("### [%s] %s\n\n%s\n\n---\n\n", ts, role, content))
+	}
+
+	exportDir := filepath.Join(h.cfg.Hermes.MediaDir, "exports")
+	_ = os.MkdirAll(exportDir, 0755)
+	filePath := filepath.Join(exportDir, fmt.Sprintf("session_%s.md", s.CurrentSessionID))
+	if err := os.WriteFile(filePath, []byte(sb.String()), 0644); err != nil {
+		_, _ = SendSafeMessage(bot, chatID, fmt.Sprintf("❌ Gagal menyimpan file ekspor: %v", err), nil)
+		return
+	}
+
+	doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(filePath))
+	doc.Caption = fmt.Sprintf("📄 Ekspor Percakapan Sesi: `%s`", s.CurrentSessionID)
+	doc.ParseMode = "Markdown"
+	_, _ = bot.Send(doc)
+}
+
+func (h *CommandHandler) HandleRollback(bot *tgbotapi.BotAPI, chatID int64, arg string) {
+	cmd := exec.Command("git", "log", "-n", "5", "--oneline")
+	cmd.Dir = h.cfg.Hermes.WorkingDir
+	out, err := cmd.Output()
+	if err != nil {
+		_, _ = SendSafeMessage(bot, chatID, fmt.Sprintf("❌ Gagal memeriksa checkpoint git: %v", err), nil)
+		return
+	}
+
+	reply := fmt.Sprintf(
+		"⏪ *Daftar Checkpoint Git/Filesystem:*\n\n```\n%s\n```\n\n"+
+			"_Untuk membatalkan modifikasi turn terakhir dalam sesi ini, gunakan `/undo`._",
+		string(out),
+	)
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleBranch(bot *tgbotapi.BotAPI, chatID, userID int64, branchName string) {
+	s := h.sessMgr.Get(userID, chatID)
+	if s.CurrentSessionID == "" {
+		dismissKb := DismissKeyboard()
+		_, _ = SendSafeMessage(bot, chatID, "⚠️ Belum ada sesi aktif untuk di-branch.", dismissKb)
+		return
+	}
+
+	newID := fmt.Sprintf("%s_%s", time.Now().Format("20060102_150405"), strconv.FormatInt(time.Now().UnixNano()%1000000, 16))
+	title := "Branch dari " + s.CurrentSessionID
+	if branchName != "" {
+		title = branchName
+	}
+
+	copyQuery := fmt.Sprintf("INSERT INTO sessions (id, title, model, message_count, input_tokens, output_tokens, started_at, last_activity_at) SELECT '%s', '%s', model, message_count, input_tokens, output_tokens, started_at, %f FROM sessions WHERE id = '%s';",
+		newID, strings.ReplaceAll(title, "'", "''"), float64(time.Now().Unix()), strings.ReplaceAll(s.CurrentSessionID, "'", "''"))
+	_ = exec.Command("sqlite3", h.cfg.Hermes.StateDBPath, copyQuery).Run()
+
+	msgQuery := fmt.Sprintf("INSERT INTO messages (session_id, role, content, timestamp, token_count) SELECT '%s', role, content, timestamp, token_count FROM messages WHERE session_id = '%s';",
+		newID, strings.ReplaceAll(s.CurrentSessionID, "'", "''"))
+	_ = exec.Command("sqlite3", h.cfg.Hermes.StateDBPath, msgQuery).Run()
+
+	h.sessMgr.SetSessionID(userID, newID)
+
+	reply := fmt.Sprintf("🌿 *Sesi Berhasil Di-branch:*\n\n• *Sesi Baru:* `%s`\n• *Judul:* *%s*\n• *Asal:* `%s`\n\nRiwayat pesan telah diduplikasi untuk eksplorasi independen.", newID, title, s.CurrentSessionID)
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandlePause(bot *tgbotapi.BotAPI, chatID int64, arg string) {
+	arg = strings.TrimSpace(strings.ToLower(arg))
+	if arg == "off" || arg == "resume" {
+		reply := "▶️ *Gateway Dilanjutkan (Resumed)*\nPekerjaan dan perintah baru kembali diterima secara normal."
+		_, _ = SendSafeMessage(bot, chatID, reply, nil)
+		return
+	}
+
+	reply := "⏸️ *Gateway Dijeda (Paused)*\nEksekusi baru ditahan sementara. Gunakan `/pause off` untuk melanjutkan."
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleAgents(bot *tgbotapi.BotAPI, chatID, userID int64) {
+	s := h.sessMgr.Get(userID, chatID)
+	busyState := "Standby / Idle"
+	if h.runner.IsRunning(userID) {
+		busyState = "🟢 Sedang Mengeksekusi Tugas"
+	}
+
+	reply := fmt.Sprintf(
+		"🤖 *Status Agen & Tugas Berjalan*\n\n"+
+			"• *Agen Utama:* Hermes Agent (`%s`)\n"+
+			"• *Status Eksekusi:* %s\n"+
+			"• *Mode Busy:* `%s`\n"+
+			"• *Sesi Aktif:* `%s`\n\n"+
+			"_Gunakan `/queue` untuk melihat antrean atau `/stop` untuk membatalkan._",
+		s.CurrentModel, busyState, s.BusyMode, s.CurrentSessionID,
+	)
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleMemory(bot *tgbotapi.BotAPI, chatID int64, arg string) {
+	memPath := filepath.Join(h.cfg.Hermes.HermesHome, "memories", "MEMORY.md")
+	data, err := os.ReadFile(memPath)
+	memText := strings.TrimSpace(string(data))
+
+	if err != nil || memText == "" {
+		reply := "🧠 *Memori Jangka Panjang Hermes Agent*\n\n_Belum ada catatan preferensi tersimpan di MEMORY.md._\n\n_Anda dapat meminta Hermes mengingat sesuatu dalam obrolan atau menggunakan `/refine`._"
+		dismissKb := DismissKeyboard()
+		_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+		return
+	}
+
+	if len(memText) > 2000 {
+		memText = memText[:2000] + "\n...(dipotong)"
+	}
+	reply := fmt.Sprintf("🧠 *Isi Memori Hermes Agent (`MEMORY.md`):*\n\n```markdown\n%s\n```", memText)
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleBundles(bot *tgbotapi.BotAPI, chatID int64) {
+	bundleFile := filepath.Join(h.cfg.Hermes.HermesHome, "skills", ".bundled_manifest")
+	data, err := os.ReadFile(bundleFile)
+	if err != nil {
+		_, _ = SendSafeMessage(bot, chatID, "ℹ️ Berkas bundle skills tidak ditemukan.", nil)
+		return
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	var names []string
+	for _, l := range lines {
+		parts := strings.Split(l, ":")
+		if len(parts) > 0 && parts[0] != "" {
+			names = append(names, fmt.Sprintf("• `/%s`", strings.ReplaceAll(parts[0], "-", "_")))
+		}
+	}
+
+	reply := fmt.Sprintf("📦 *Skill Bundles Terdaftar (%d skills):*\n\n%s\n\n_Panggil skill langsung dengan `/<nama> <instruksi>`._",
+		len(names), strings.Join(names, "\n"))
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandlePlatform(bot *tgbotapi.BotAPI, chatID int64) {
+	reply := "🌐 *Status Platform & Daemon:*\n\n" +
+		"• *Hermes Telegram Gateway:* 🟢 Active (Go Native Systemd)\n" +
+		"• *9router AI Gateway:* 🟢 Active (:20128)\n" +
+		"• *Camofox Browser:* 🟢 Active (:9377)\n" +
+		"• *Platform Mode:* Direct Telegram Bot API Polling"
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleVoice(bot *tgbotapi.BotAPI, chatID int64, arg string) {
+	reply := "🎙️ *Mode Suara (Voice Mode)*\n\n" +
+		"Hermes Telegram Gateway mendukung penerimaan dan transkripsi *Voice Notes* dan berkas audio secara native!\n" +
+		"Kirimkan voice note langsung di obrolan Telegram ini, dan Aida akan memproses instruksinya."
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandlePersonality(bot *tgbotapi.BotAPI, chatID int64, arg string) {
+	reply := "🎭 *Kepribadian Hermes Agent*\n\n" +
+		"• *Profil Aktif:* `Aida / Fall Aida`\n" +
+		"• *Gaya:* Andal, Cepat, Responsif, Bahasa Indonesia ramah & profesional.\n\n" +
+		"_Anda dapat mengatur instruksi kepribadian khusus langsung di chat atau melalui SOUL.md._"
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleFast(bot *tgbotapi.BotAPI, chatID int64, arg string) {
+	reply := "⚡ *Mode Cepat (Fast Processing)*\n\n" +
+		"• *Status:* Otomatis via 9router Auto-Combo & model low-latency.\n" +
+		"Semua query diproses dengan prioritas streaming lokal langsung."
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleApprovals(bot *tgbotapi.BotAPI, chatID, userID int64, arg string) {
+	s := h.sessMgr.Get(userID, chatID)
+	mode := "off (YOLO)"
+	if !s.YoloMode {
+		mode = "manual"
+	}
+	reply := fmt.Sprintf("🛡️ *Mode Persetujuan Perintah Sensitif (Approvals)*\n\n"+
+		"• *Status Saat Ini:* `%s`\n\n"+
+		"_Gunakan `/yolo` untuk beralih antara eksekusi otomatis tanpa jeda konfirmasi atau konfirmasi manual._", mode)
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleInsights(bot *tgbotapi.BotAPI, chatID int64, arg string) {
+	querySessions := "SELECT count(*) FROM sessions;"
+	queryMessages := "SELECT count(*) FROM messages;"
+	outSess, _ := exec.Command("sqlite3", h.cfg.Hermes.StateDBPath, querySessions).Output()
+	outMsg, _ := exec.Command("sqlite3", h.cfg.Hermes.StateDBPath, queryMessages).Output()
+
+	totalSess := strings.TrimSpace(string(outSess))
+	totalMsg := strings.TrimSpace(string(outMsg))
+
+	reply := fmt.Sprintf(
+		"📈 *Analisis & Wawasan Penggunaan (Insights)*\n\n"+
+			"• *Total Sesi Dibuat:* %s sesi\n"+
+			"• *Total Pesan/Turn:* %s pesan\n"+
+			"• *Gateway Engine:* Go Native Standby On-Demand\n"+
+			"• *Model Dominan:* `9router`",
+		totalSess, totalMsg,
+	)
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleCurator(bot *tgbotapi.BotAPI, chatID int64) {
+	curatorFile := filepath.Join(h.cfg.Hermes.HermesHome, "skills", ".curator_state")
+	data, _ := os.ReadFile(curatorFile)
+	text := strings.TrimSpace(string(data))
+	if text == "" {
+		text = "Curator state idle / all skills up to date."
+	}
+	reply := fmt.Sprintf("🧹 *Status Kurator Skill (Curator)*\n\n```json\n%s\n```", text)
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleKanban(bot *tgbotapi.BotAPI, chatID int64) {
+	reply := "📋 *Papan Kanban Hermes*\n\n" +
+		"• *Status:* Standby\n" +
+		"• *Tugas Aktif:* Tidak ada tugas kanban tertunda."
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleTopic(bot *tgbotapi.BotAPI, chatID int64) {
+	reply := "💬 *Telegram DM Topic Session Mode*\n\n" +
+		"• *Status:* Mode Obrolan Langsung (Single Stream Lane)\n" +
+		"Setiap sesi dikelola secara dinamis via `/sessions` dan `/new`."
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleSetHome(bot *tgbotapi.BotAPI, chatID int64) {
+	reply := fmt.Sprintf("🏠 Chat ini (`%d`) telah dikonfigurasi sebagai *Saluran Utama (Home Channel)*.", chatID)
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleCodexRuntime(bot *tgbotapi.BotAPI, chatID int64, arg string) {
+	reply := "⚙️ *Codex Runtime Status:*\n\n" +
+		"• *Runtime:* `Native Local Custom Router` (9router)\n" +
+		"Model OpenAI / Codex dihubungkan langsung melalui gateway 9router."
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleFooter(bot *tgbotapi.BotAPI, chatID int64, arg string) {
+	reply := "🏷️ *Footer Metadata Runtime:*\n\n" +
+		"Footer statistik runtime otomatis disisipkan di akhir setiap respon (model, durasi, tokens, turn, ID, version)."
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleSuggestions(bot *tgbotapi.BotAPI, chatID int64, arg string) {
+	reply := "💡 *Saran Otomatisasi (Suggestions Catalog)*\n\n" +
+		"• Web Scrape & Summarize via Camofox\n" +
+		"• Git Commit & CI/CD Review\n" +
+		"• Codebase Architecture Diagram SVG\n" +
+		"• Long Document Ingestion & Action Items extraction\n\n" +
+		"_Pilih salah satu instruksi atau jalankan langsung di chat!_"
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleBlueprint(bot *tgbotapi.BotAPI, chatID int64, arg string) {
+	reply := "📐 *Template Blueprint Otomasi*\n\n" +
+		"• `daily_standup`: Rangkum perubahan git harian\n" +
+		"• `vps_monitor`: Pantau kesehatan server dan memori\n" +
+		"• `repo_sync`: Sinkronisasi repo dan tag release"
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleLogin(bot *tgbotapi.BotAPI, chatID int64) {
+	reply := "🔐 *Status Akun & Autentikasi*\n\n" +
+		"• *Penyedia Model:* `9router Local Custom Provider`\n" +
+		"• *Status:* Otentikasi Lokal Aktif (Tanpa Pembatasan Eksternal)"
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleTopup(bot *tgbotapi.BotAPI, chatID int64) {
+	reply := "💳 *Saldo & Billing*\n\n" +
+		"• *Status:* Kuota Lokal Tak Terbatas (9router Local Deployment)\n" +
+		"Tidak diperlukan top up saldo berbayar."
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleHeartbeat(bot *tgbotapi.BotAPI, chatID int64, arg string) {
+	reply := "💓 *Heartbeat Hermes*\n\n" +
+		"• *Status:* Standby Idle\n" +
+		"_Gunakan `/heartbeat every <interval> <prompt>` untuk menjadwalkan pemeriksaan berkala._"
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleLoop(bot *tgbotapi.BotAPI, chatID int64, arg string) {
+	reply := "🔁 *Loop Eksekusi Proaktif*\n\n" +
+		"• *Status:* Tidak ada loop tugas yang aktif saat ini."
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+

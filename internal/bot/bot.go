@@ -158,52 +158,53 @@ func (s *BotServer) handleCallbackQuery(cb *tgbotapi.CallbackQuery) {
 		return
 	}
 
-	ans := tgbotapi.NewCallback(cb.ID, "")
-	_, _ = s.bot.Request(ans)
-
 	switch {
 	case data == "cancel_task":
 		s.aggregator.Cancel(userID)
 		if s.runner.Stop(userID) {
 			_, _ = EditSafeMessage(s.bot, chatID, cb.Message.MessageID, "🛑 *Tugas telah dibatalkan oleh pengguna.*", nil)
 		}
+		_, _ = s.bot.Request(tgbotapi.NewCallback(cb.ID, "🛑 Tugas dibatalkan"))
 
 	case strings.HasPrefix(data, "set_model:"):
 		modelName := strings.TrimPrefix(data, "set_model:")
 		s.sessMgr.SetModel(userID, modelName)
-		kb := ModelKeyboard(modelName)
-		text := fmt.Sprintf("✅ *Model AI Berhasil Diubah*\n\nModel aktif sekarang: `%s`", modelName)
-		_, _ = EditSafeMessage(s.bot, chatID, cb.Message.MessageID, text, &kb)
+		// Delete menu message to keep the chat completely clean
+		_, _ = s.bot.Send(tgbotapi.NewDeleteMessage(chatID, cb.Message.MessageID))
+		_, _ = s.bot.Request(tgbotapi.NewCallback(cb.ID, fmt.Sprintf("✅ Model aktif: %s", modelName)))
 
 	case strings.HasPrefix(data, "set_reasoning:"):
 		effort := strings.TrimPrefix(data, "set_reasoning:")
 		s.sessMgr.SetReasoning(userID, effort)
-		kb := ReasoningKeyboard(effort)
-		text := fmt.Sprintf("✅ *Tingkat Penalaran Diubah*\n\nPengaturan aktif: `%s`", strings.ToUpper(effort))
-		_, _ = EditSafeMessage(s.bot, chatID, cb.Message.MessageID, text, &kb)
+		// Delete menu message to keep the chat completely clean
+		_, _ = s.bot.Send(tgbotapi.NewDeleteMessage(chatID, cb.Message.MessageID))
+		_, _ = s.bot.Request(tgbotapi.NewCallback(cb.ID, fmt.Sprintf("✅ Penalaran: %s", strings.ToUpper(effort))))
 
-	case data == "dismiss_msg" || data == "delete_msg":
-		del := tgbotapi.NewDeleteMessage(chatID, cb.Message.MessageID)
-		_, _ = s.bot.Send(del)
-		return
+	case data == "dismiss_msg" || data == "delete_msg" || data == "cancel_menu":
+		_, _ = s.bot.Send(tgbotapi.NewDeleteMessage(chatID, cb.Message.MessageID))
+		_, _ = s.bot.Request(tgbotapi.NewCallback(cb.ID, "✖️ Menu ditutup"))
 
 	case strings.HasPrefix(data, "resume_session:"):
 		sessionID := strings.TrimPrefix(data, "resume_session:")
 		s.sessMgr.SetSessionID(userID, sessionID)
-		dismissKb := DismissKeyboard()
-		text := fmt.Sprintf("✅ *Sesi Berhasil Dialihkan*\n\nSesi aktif saat ini: `%s`", sessionID)
-		_, _ = EditSafeMessage(s.bot, chatID, cb.Message.MessageID, text, &dismissKb)
+		// Delete menu message to keep the chat completely clean
+		_, _ = s.bot.Send(tgbotapi.NewDeleteMessage(chatID, cb.Message.MessageID))
+		_, _ = s.bot.Request(tgbotapi.NewCallback(cb.ID, fmt.Sprintf("✅ Beralih ke sesi: %s", sessionID)))
 
 	case data == "new_session":
 		s.sessMgr.ResetSession(userID)
-		dismissKb := DismissKeyboard()
-		text := "✨ *Sesi Baru Disiapkan*\n\nKirim pesan untuk memulai percakapan baru dengan Aida."
-		_, _ = EditSafeMessage(s.bot, chatID, cb.Message.MessageID, text, &dismissKb)
+		// Delete menu message to keep the chat completely clean
+		_, _ = s.bot.Send(tgbotapi.NewDeleteMessage(chatID, cb.Message.MessageID))
+		_, _ = s.bot.Request(tgbotapi.NewCallback(cb.ID, "✨ Sesi baru telah disiapkan"))
 
 	case strings.HasPrefix(data, "cmd_page:"):
 		pageStr := strings.TrimPrefix(data, "cmd_page:")
 		page, _ := strconv.Atoi(pageStr)
 		s.cmdHandler.HandleCommands(s.bot, chatID, page)
+		_, _ = s.bot.Request(tgbotapi.NewCallback(cb.ID, ""))
+
+	default:
+		_, _ = s.bot.Request(tgbotapi.NewCallback(cb.ID, ""))
 	}
 }
 
@@ -327,6 +328,148 @@ func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
 		s.handleRetryCommand(chatID, userID, arg)
 	case "/undo":
 		s.handleUndoCommand(chatID, userID)
+	case "/egress":
+		s.cmdHandler.HandleEgress(s.bot, chatID)
+	case "/debug":
+		s.cmdHandler.HandleDebug(s.bot, chatID, arg)
+	case "/usage":
+		s.cmdHandler.HandleUsage(s.bot, chatID, userID, arg)
+	case "/approve":
+		s.cmdHandler.HandleApprove(s.bot, chatID, userID, arg)
+	case "/deny":
+		s.cmdHandler.HandleDeny(s.bot, chatID, userID, arg)
+	case "/compress", "/compact":
+		s.cmdHandler.HandleCompress(s.bot, chatID, userID, arg)
+	case "/restart":
+		s.cmdHandler.HandleRestart(s.bot, chatID)
+	case "/update":
+		s.cmdHandler.HandleUpdate(s.bot, chatID, arg)
+	case "/save", "/export":
+		s.cmdHandler.HandleSave(s.bot, chatID, userID, arg)
+	case "/rollback":
+		s.cmdHandler.HandleRollback(s.bot, chatID, arg)
+	case "/branch", "/fork":
+		s.cmdHandler.HandleBranch(s.bot, chatID, userID, arg)
+	case "/pause":
+		s.cmdHandler.HandlePause(s.bot, chatID, arg)
+	case "/agents", "/tasks":
+		s.cmdHandler.HandleAgents(s.bot, chatID, userID)
+	case "/memory":
+		s.cmdHandler.HandleMemory(s.bot, chatID, arg)
+	case "/bundles":
+		s.cmdHandler.HandleBundles(s.bot, chatID)
+	case "/platform", "/platforms":
+		s.cmdHandler.HandlePlatform(s.bot, chatID)
+	case "/voice":
+		s.cmdHandler.HandleVoice(s.bot, chatID, arg)
+	case "/personality":
+		s.cmdHandler.HandlePersonality(s.bot, chatID, arg)
+	case "/fast":
+		s.cmdHandler.HandleFast(s.bot, chatID, arg)
+	case "/approvals":
+		s.cmdHandler.HandleApprovals(s.bot, chatID, userID, arg)
+	case "/insights":
+		s.cmdHandler.HandleInsights(s.bot, chatID, arg)
+	case "/curator":
+		s.cmdHandler.HandleCurator(s.bot, chatID)
+	case "/kanban":
+		s.cmdHandler.HandleKanban(s.bot, chatID)
+	case "/topic":
+		s.cmdHandler.HandleTopic(s.bot, chatID)
+	case "/sethome", "/set-home":
+		s.cmdHandler.HandleSetHome(s.bot, chatID)
+	case "/codex_runtime", "/codex-runtime":
+		s.cmdHandler.HandleCodexRuntime(s.bot, chatID, arg)
+	case "/footer":
+		s.cmdHandler.HandleFooter(s.bot, chatID, arg)
+	case "/suggestions", "/suggest":
+		s.cmdHandler.HandleSuggestions(s.bot, chatID, arg)
+	case "/blueprint", "/bp":
+		s.cmdHandler.HandleBlueprint(s.bot, chatID, arg)
+	case "/login":
+		s.cmdHandler.HandleLogin(s.bot, chatID)
+	case "/topup":
+		s.cmdHandler.HandleTopup(s.bot, chatID)
+	case "/heartbeat", "/hb":
+		s.cmdHandler.HandleHeartbeat(s.bot, chatID, arg)
+	case "/loop", "/proactive":
+		s.cmdHandler.HandleLoop(s.bot, chatID, arg)
+	case "/goal":
+		if arg == "" {
+			sent, _ := SendSafeMessage(s.bot, chatID, "🎯 *Target Goal Hermes:*\n\nFormat penggunaan: `/goal <deskripsi target>`\nHermes akan bekerja secara persisten melintasi turn sampai target tercapai.", nil)
+			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			return
+		}
+		s.executeTask(chatID, userID, fmt.Sprintf("Target Goal: %s\nKerjakan secara bertahap sampai tujuan ini tercapai.", arg), "", "", 1)
+	case "/plan":
+		if arg == "" {
+			sent, _ := SendSafeMessage(s.bot, chatID, "📝 *Perencanaan Implementasi (Plan):*\n\nFormat: `/plan <tugas atau fitur>`\nHermes akan menyusun rencana implementasi markdown terperinci tanpa mengeksekusi aksi berbahaya.", nil)
+			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			return
+		}
+		s.executeTask(chatID, userID, fmt.Sprintf("Buatkan rencana implementasi (architecture & action plan) lengkap dalam markdown untuk: %s\nJangan langsung eksekusi atau merubah file, fokus pada analisa dan rencana tindakan.", arg), "", "", 1)
+	case "/review":
+		prompt := "Tinjau (review) pekerjaan dan kode yang telah dikerjakan di sesi ini secara kritis. Berikan catatan kualitas, temuan bug, dan rekomendasi penyempurnaan."
+		if arg != "" {
+			prompt = fmt.Sprintf("Tinjau (review) hal berikut: %s\nFokus pada kebenaran arsitektur, keamanan, dan efisiensi.", arg)
+		}
+		s.executeTask(chatID, userID, prompt, "", "", 1)
+	case "/refine":
+		prompt := "Tinjau percakapan sesi ini dan simpan pelajaran atau wawasan penting ke memori."
+		if arg != "" {
+			prompt += fmt.Sprintf(" Fokus: %s", arg)
+		}
+		s.executeTask(chatID, userID, prompt, "", "", 1)
+	case "/moa":
+		if arg == "" {
+			sent, _ := SendSafeMessage(s.bot, chatID, "🧬 *Mixture of Agents (MoA):*\n\nFormat: `/moa <prompt>`\nMenjalankan satu prompt melalui perpaduan model.", nil)
+			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			return
+		}
+		s.executeTask(chatID, userID, arg, "", "", 1)
+	case "/subgoal":
+		if arg == "" {
+			sent, _ := SendSafeMessage(s.bot, chatID, "🎯 *Kriteria Subgoal:*\n\nFormat: `/subgoal <kriteria tambahan pada goal>`", nil)
+			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			return
+		}
+		s.executeTask(chatID, userID, fmt.Sprintf("Tambahkan kriteria subgoal berikut: %s", arg), "", "", 1)
+	case "/learn":
+		if arg == "" {
+			sent, _ := SendSafeMessage(s.bot, chatID, "🎓 *Hermes Skill Learning:*\n\nFormat: `/learn <hal atau dokumentasi yang ingin dipelajari>`\nHermes akan membuat skill reusable baru di ~/.hermes/skills/", nil)
+			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			return
+		}
+		s.executeTask(chatID, userID, fmt.Sprintf("Pelajari dan buat skill reusable baru untuk: %s\nSimpan dokumen SKILL.md ke ~/.hermes/skills/", arg), "", "", 1)
+	case "/init":
+		prompt := "Pindai repositori proyek ini dan perbarui atau buat file AGENTS.md dengan panduan instruksi proyek yang lengkap."
+		if arg != "" {
+			prompt += fmt.Sprintf(" Catatan tambahan: %s", arg)
+		}
+		s.executeTask(chatID, userID, prompt, "", "", 1)
+	case "/bg":
+		if arg == "" {
+			sent, _ := SendSafeMessage(s.bot, chatID, "⚙️ *Tugas Latar Belakang (Background Task):*\n\nFormat: `/bg <instruksi tugas>`\nMenjalankan tugas di sesi latar belakang independen.", nil)
+			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			return
+		}
+		go func() {
+			s.executeTask(chatID, userID, arg, "", "", 1)
+		}()
+	case "/btw":
+		if arg == "" {
+			sent, _ := SendSafeMessage(s.bot, chatID, "💬 *Pertanyaan Sampingan (By The Way):*\n\nFormat: `/btw <pertanyaan singkat>`\nMenanyakan pertanyaan sampingan tanpa merusak alur fokus.", nil)
+			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			return
+		}
+		s.executeTask(chatID, userID, fmt.Sprintf("[Pertanyaan Sampingan (BTW)]: %s", arg), "", "", 1)
+	case "/steer":
+		if arg == "" {
+			sent, _ := SendSafeMessage(s.bot, chatID, "🧭 *Steer Agent:*\n\nFormat: `/steer <arahan tindakan berikutnya>`", nil)
+			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			return
+		}
+		s.handleQueueCommand(chatID, userID, arg)
 	default:
 		skillName := strings.TrimPrefix(cmd, "/")
 		skillsDir := filepath.Join(s.cfg.Hermes.HermesHome, "skills")

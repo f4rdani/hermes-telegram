@@ -1,0 +1,15 @@
+[Unit]
+Description=Hermes Telegram On-Demand Bridge (Native Go)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/apps/hermes-tele
+ExecStart=/root/apps/hermes-tele/hermes-tele -config /root/apps/hermes-tele/config.json
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+{
+  "telegram": {
+    "bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
+    "allowed_user_ids": [
+      123456789
+    ]
+  },
+  "hermes": {
+    "binary_path": "/usr/local/bin/hermes",
+    "default_model": "9router",
+    "working_dir": "/root"
+  }
+}

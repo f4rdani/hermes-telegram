@@ -47,13 +47,14 @@ func NewBotServer(cfg *config.Config, version string) (*BotServer, error) {
 
 	sessMgr := session.NewManager(
 		cfg.Hermes.DefaultModel,
-		"/root/apps/hermes-tele/sessions.json",
+		cfg.Hermes.SessionsPath,
 		cfg.Hermes.StateDBPath,
 		cfg.Hermes.BinaryPath,
 	)
 
+	modelResolver := NewModelResolver(cfg.Hermes.GatewayURL, cfg.Hermes.GatewayKey)
 	runner := engine.NewRunner(cfg.Hermes.BinaryPath)
-	cmdHandler := NewCommandHandler(cfg, sessMgr, runner, version)
+	cmdHandler := NewCommandHandler(cfg, sessMgr, runner, modelResolver, version)
 
 	server := &BotServer{
 		bot:         bot,

@@ -17,20 +17,22 @@ import (
 )
 
 type CommandHandler struct {
-	cfg        *config.Config
-	sessMgr    *session.Manager
-	runner     *engine.Runner
-	version    string
-	startTime  time.Time
+	cfg           *config.Config
+	sessMgr       *session.Manager
+	runner        *engine.Runner
+	modelResolver *ModelResolver
+	version       string
+	startTime     time.Time
 }
 
-func NewCommandHandler(cfg *config.Config, sessMgr *session.Manager, runner *engine.Runner, version string) *CommandHandler {
+func NewCommandHandler(cfg *config.Config, sessMgr *session.Manager, runner *engine.Runner, modelResolver *ModelResolver, version string) *CommandHandler {
 	return &CommandHandler{
-		cfg:       cfg,
-		sessMgr:   sessMgr,
-		runner:    runner,
-		version:   version,
-		startTime: time.Now(),
+		cfg:           cfg,
+		sessMgr:       sessMgr,
+		runner:        runner,
+		modelResolver: modelResolver,
+		version:       version,
+		startTime:     time.Now(),
 	}
 }
 
@@ -44,12 +46,12 @@ func (h *CommandHandler) HandleStart(bot *tgbotapi.BotAPI, chatID, userID int64)
 	reply := fmt.Sprintf(
 		"🕊️ *Selamat Datang di Hermes Agent Telegram Gateway*\n\n"+
 			"🤖 *Status Sistem:* Standby On-Demand (~10 MB RAM)\n"+
-			"⚡ *Model:* `%s` via 9router\n"+
+			"⚡ *Model:* `%s` via %s\n"+
 			"🧠 *Reasoning:* `%s` | *YOLO:* `%v`\n"+
 			"📂 *Workspace:* `%s`\n"+
 			"🔖 *Sesi Aktif:* %s\n\n"+
 			"💡 *Perintah Utama:*\n"+
-			"• `/status` - Cek penggunaan RAM, koneksi 9router & Camofox\n"+
+			"• `/status` - Cek penggunaan RAM, koneksi %s & Camofox\n"+
 			"• `/new` - Mulai sesi percakapan baru yang segar\n"+
 			"• `/sessions` - Lihat & pilih daftar sesi sebelumnya\n"+
 			"• `/model` - Pilih / ganti model kecerdasan buatan\n"+
@@ -57,7 +59,8 @@ func (h *CommandHandler) HandleStart(bot *tgbotapi.BotAPI, chatID, userID int64)
 			"• `/commands` - Jelajahi 100+ perintah & skills interaktif\n"+
 			"• `/help` - Bantuan lengkap seluruh perintah\n\n"+
 			"Kirim pesan teks, instruksi, foto, voice note, atau dokumen untuk memulai!",
-		s.CurrentModel, s.ReasoningEffort, s.YoloMode, h.cfg.Hermes.WorkingDir, sessionInfo,
+		s.CurrentModel, h.cfg.Hermes.GatewayName, s.ReasoningEffort, s.YoloMode, h.cfg.Hermes.WorkingDir, sessionInfo,
+		h.cfg.Hermes.GatewayName,
 	)
 
 	dismissKb := DismissKeyboard()
@@ -68,30 +71,31 @@ func (h *CommandHandler) HandleHelp(bot *tgbotapi.BotAPI, chatID, userID int64, 
 	query = strings.TrimSpace(strings.ToLower(query))
 
 	if query == "" {
-		reply := "📖 *Panduan Perintah Hermes Telegram*\n\n" +
-			"🔹 *Manajemen Sesi:*\n" +
-			"• `/new` - Mulai sesi baru (fresh session ID + history)\n" +
-			"• `/sessions` - Telusuri & resume sesi-sesi sebelumnya\n" +
-			"• `/resume <id>` - Lanjutkan sesi tertentu berdasarkan ID\n" +
-			"• `/title <nama>` - Beri judul untuk sesi aktif saat ini\n" +
-			"• `/clear` - Hapus histori sesi aktif\n\n" +
-			"🔹 *Konfigurasi & Model:*\n" +
-			"• `/model [nama]` - Ganti model AI (atau klik menu interaktif)\n" +
-			"• `/reasoning [level]` - Atur effort penalaran (none/low/med/high)\n" +
-			"• `/yolo` - Toggle mode YOLO (auto-approve aksi sensitif)\n" +
-			"• `/stop` - Hentikan tugas yang sedang berjalan\n\n" +
-			"🔹 *Informasi & Diagnostik:*\n" +
-			"• `/status` - Status RAM, CPU, 9router, Camofox & sesi\n" +
-			"• `/context` - Grafik visual pemakaian token jendela konteks\n" +
-			"• `/diff` - Cek perubahan git di direktori kerja\n" +
-			"• `/whoami` - Info otorisasi akun Telegram Anda\n" +
-			"• `/profile` - Info direktori dan konfigurasi profil\n" +
-			"• `/version` - Versi Hermes & Go Gateway\n\n" +
-			"🔹 *Skills & Ekstensi:*\n" +
-			"• `/skills` - Daftar skill yang terpasang\n" +
-			"• `/reload_skills` - Muat ulang skill dari disk\n" +
-			"• `/reload_mcp` - Muat ulang konfigurasi MCP server\n" +
-			"• `/commands` - Menu interaktif seluruh 100+ perintah"
+		reply := fmt.Sprintf("📖 *Panduan Perintah Hermes Telegram*\n\n"+
+			"🔹 *Manajemen Sesi:*\n"+
+			"• `/new` - Mulai sesi baru (fresh session ID + history)\n"+
+			"• `/sessions` - Telusuri & resume sesi-sesi sebelumnya\n"+
+			"• `/resume <id>` - Lanjutkan sesi tertentu berdasarkan ID\n"+
+			"• `/title <nama>` - Beri judul untuk sesi aktif saat ini\n"+
+			"• `/clear` - Hapus histori sesi aktif\n\n"+
+			"🔹 *Konfigurasi & Model:*\n"+
+			"• `/model [nama]` - Ganti model AI (atau klik menu interaktif)\n"+
+			"• `/reasoning [level]` - Atur effort penalaran (none/low/med/high)\n"+
+			"• `/yolo` - Toggle mode YOLO (auto-approve aksi sensitif)\n"+
+			"• `/stop` - Hentikan tugas yang sedang berjalan\n\n"+
+			"🔹 *Informasi & Diagnostik:*\n"+
+			"• `/status` - Status RAM, CPU, %s, Camofox & sesi\n"+
+			"• `/context` - Grafik visual pemakaian token jendela konteks\n"+
+			"• `/diff` - Cek perubahan git di direktori kerja\n"+
+			"• `/whoami` - Info otorisasi akun Telegram Anda\n"+
+			"• `/profile` - Info direktori dan konfigurasi profil\n"+
+			"• `/version` - Versi Hermes & Go Gateway\n\n"+
+			"🔹 *Skills & Ekstensi:*\n"+
+			"• `/skills` - Daftar skill yang terpasang\n"+
+			"• `/reload_skills` - Muat ulang skill dari disk\n"+
+			"• `/reload_mcp` - Muat ulang konfigurasi MCP server\n"+
+			"• `/commands` - Menu interaktif seluruh 100+ perintah",
+			h.cfg.Hermes.GatewayName)
 
 		dismissKb := DismissKeyboard()
 		_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
@@ -163,20 +167,34 @@ func (h *CommandHandler) HandleStatus(bot *tgbotapi.BotAPI, chatID, userID int64
 		}
 	}
 
-	// 2. 9router ping (Instant check on 127.0.0.1:20128 without slow upstream probe)
-	routerStatus := "🟢 Online (:20128)"
+	// 2. Gateway ping
+	gwName := h.cfg.Hermes.GatewayName
+	if gwName == "" {
+		gwName = "GoGate"
+	}
+	gwURL := h.cfg.Hermes.GatewayURL
+	if gwURL == "" {
+		gwURL = "http://127.0.0.1:8080"
+	}
+	gwStatus := fmt.Sprintf("🟢 Online (%s)", gwURL)
 	client := http.Client{
-		Timeout: 1 * time.Second,
+		Timeout: 1200 * time.Millisecond,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
-	resp, err := client.Get("http://127.0.0.1:20128/")
-	if err != nil || (resp != nil && resp.StatusCode >= 500) {
-		routerStatus = "🔴 Offline / Bermasalah"
-	}
-	if resp != nil {
-		_ = resp.Body.Close()
+	reqGw, _ := http.NewRequest("GET", strings.TrimRight(gwURL, "/")+"/v1/models", nil)
+	if reqGw != nil {
+		if h.cfg.Hermes.GatewayKey != "" {
+			reqGw.Header.Set("Authorization", "Bearer "+h.cfg.Hermes.GatewayKey)
+		}
+		respGw, errGw := client.Do(reqGw)
+		if errGw != nil || (respGw != nil && respGw.StatusCode >= 500) {
+			gwStatus = "🔴 Offline / Bermasalah"
+		}
+		if respGw != nil {
+			_ = respGw.Body.Close()
+		}
 	}
 
 	// 3. Camofox ping
@@ -214,11 +232,11 @@ func (h *CommandHandler) HandleStatus(bot *tgbotapi.BotAPI, chatID, userID int64
 			"⚡ *Effort Reasoning:* `%s`\n"+
 			"🚀 *Mode YOLO:* `%v`\n\n"+
 			"🔌 *Integrasi Layanan:*\n"+
-			"• *9router:* %s\n"+
+			"• *%s:* %s\n"+
 			"• *Camofox Browser:* %s\n\n"+
 			"🔖 *Sesi Aktif Pengguna:*\n%s",
 		ramInfo, h.version, uptime, s.CurrentModel, s.ReasoningEffort, s.YoloMode,
-		routerStatus, camofoxStatus, sessionDetails,
+		gwName, gwStatus, camofoxStatus, sessionDetails,
 	)
 
 	dismissKb := DismissKeyboard()
@@ -279,7 +297,11 @@ func (h *CommandHandler) HandleModel(bot *tgbotapi.BotAPI, chatID, userID int64,
 
 	if modelArg == "" {
 		reply := fmt.Sprintf("🤖 *Pengaturan Model AI*\n\nModel aktif saat ini: `%s`\n\nPilih salah satu model di bawah atau ketik `/model <nama_model>`:", s.CurrentModel)
-		kb := ModelKeyboard(s.CurrentModel)
+		var models []ModelInfo
+		if h.modelResolver != nil {
+			models = h.modelResolver.GetModels(h.cfg, s.CurrentModel)
+		}
+		kb := ModelKeyboard(s.CurrentModel, models)
 		_, _ = SendSafeMessage(bot, chatID, reply, kb)
 		return
 	}
@@ -660,7 +682,7 @@ func (h *CommandHandler) HandleUsage(bot *tgbotapi.BotAPI, chatID, userID int64,
 		sb.WriteString("_Belum ada data penggunaan tercatat di database._\n")
 	}
 
-	sb.WriteString("\n💡 _Model lokal 9router tidak memiliki batasan kuota berbayar._")
+	sb.WriteString(fmt.Sprintf("\n💡 _Model gateway %s tidak memiliki batasan kuota berbayar._", h.cfg.Hermes.GatewayName))
 	dismissKb := DismissKeyboard()
 	_, _ = SendSafeMessage(bot, chatID, sb.String(), dismissKb)
 }
@@ -916,11 +938,20 @@ func (h *CommandHandler) HandleBundles(bot *tgbotapi.BotAPI, chatID int64) {
 }
 
 func (h *CommandHandler) HandlePlatform(bot *tgbotapi.BotAPI, chatID int64) {
-	reply := "🌐 *Status Platform & Daemon:*\n\n" +
-		"• *Hermes Telegram Gateway:* 🟢 Active (Go Native Systemd)\n" +
-		"• *9router AI Gateway:* 🟢 Active (:20128)\n" +
-		"• *Camofox Browser:* 🟢 Active (:9377)\n" +
-		"• *Platform Mode:* Direct Telegram Bot API Polling"
+	gwName := h.cfg.Hermes.GatewayName
+	if gwName == "" {
+		gwName = "GoGate"
+	}
+	gwURL := h.cfg.Hermes.GatewayURL
+	if gwURL == "" {
+		gwURL = "http://127.0.0.1:8080"
+	}
+	reply := fmt.Sprintf("🌐 *Status Platform & Daemon:*\n\n"+
+		"• *Hermes Telegram Gateway:* 🟢 Active (Go Native Systemd)\n"+
+		"• *%s AI Gateway:* 🟢 Active (%s)\n"+
+		"• *Camofox Browser:* 🟢 Active (:9377)\n"+
+		"• *Platform Mode:* Direct Telegram Bot API Polling",
+		gwName, gwURL)
 	dismissKb := DismissKeyboard()
 	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
 }
@@ -943,9 +974,10 @@ func (h *CommandHandler) HandlePersonality(bot *tgbotapi.BotAPI, chatID int64, a
 }
 
 func (h *CommandHandler) HandleFast(bot *tgbotapi.BotAPI, chatID int64, arg string) {
-	reply := "⚡ *Mode Cepat (Fast Processing)*\n\n" +
-		"• *Status:* Otomatis via 9router Auto-Combo & model low-latency.\n" +
-		"Semua query diproses dengan prioritas streaming lokal langsung."
+	reply := fmt.Sprintf("⚡ *Mode Cepat (Fast Processing)*\n\n"+
+		"• *Status:* Otomatis via %s Gateway & model low-latency.\n"+
+		"Semua query diproses dengan prioritas streaming langsung.",
+		h.cfg.Hermes.GatewayName)
 	dismissKb := DismissKeyboard()
 	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
 }
@@ -977,8 +1009,8 @@ func (h *CommandHandler) HandleInsights(bot *tgbotapi.BotAPI, chatID int64, arg 
 			"• *Total Sesi Dibuat:* %s sesi\n"+
 			"• *Total Pesan/Turn:* %s pesan\n"+
 			"• *Gateway Engine:* Go Native Standby On-Demand\n"+
-			"• *Model Dominan:* `9router`",
-		totalSess, totalMsg,
+			"• *Model Dominan / Default:* `%s`",
+		totalSess, totalMsg, h.cfg.Hermes.DefaultModel,
 	)
 	dismissKb := DismissKeyboard()
 	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
@@ -1019,9 +1051,10 @@ func (h *CommandHandler) HandleSetHome(bot *tgbotapi.BotAPI, chatID int64) {
 }
 
 func (h *CommandHandler) HandleCodexRuntime(bot *tgbotapi.BotAPI, chatID int64, arg string) {
-	reply := "⚙️ *Codex Runtime Status:*\n\n" +
-		"• *Runtime:* `Native Local Custom Router` (9router)\n" +
-		"Model OpenAI / Codex dihubungkan langsung melalui gateway 9router."
+	reply := fmt.Sprintf("⚙️ *Codex Runtime Status:*\n\n"+
+		"• *Runtime:* `OpenAI API Compatible` (%s)\n"+
+		"Model dihubungkan langsung melalui gateway %s (%s).",
+		h.cfg.Hermes.GatewayName, h.cfg.Hermes.GatewayName, h.cfg.Hermes.GatewayURL)
 	dismissKb := DismissKeyboard()
 	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
 }
@@ -1054,17 +1087,19 @@ func (h *CommandHandler) HandleBlueprint(bot *tgbotapi.BotAPI, chatID int64, arg
 }
 
 func (h *CommandHandler) HandleLogin(bot *tgbotapi.BotAPI, chatID int64) {
-	reply := "🔐 *Status Akun & Autentikasi*\n\n" +
-		"• *Penyedia Model:* `9router Local Custom Provider`\n" +
-		"• *Status:* Otentikasi Lokal Aktif (Tanpa Pembatasan Eksternal)"
+	reply := fmt.Sprintf("🔐 *Status Akun & Autentikasi*\n\n"+
+		"• *Penyedia Gateway:* `%s` (%s)\n"+
+		"• *Status:* Otentikasi Gateway Aktif",
+		h.cfg.Hermes.GatewayName, h.cfg.Hermes.GatewayURL)
 	dismissKb := DismissKeyboard()
 	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
 }
 
 func (h *CommandHandler) HandleTopup(bot *tgbotapi.BotAPI, chatID int64) {
-	reply := "💳 *Saldo & Billing*\n\n" +
-		"• *Status:* Kuota Lokal Tak Terbatas (9router Local Deployment)\n" +
-		"Tidak diperlukan top up saldo berbayar."
+	reply := fmt.Sprintf("💳 *Saldo & Billing*\n\n"+
+		"• *Status:* Multi-Provider Load Balancing via %s\n"+
+		"Kuota dan kupon dikelola langsung oleh gateway terpusat.",
+		h.cfg.Hermes.GatewayName)
 	dismissKb := DismissKeyboard()
 	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
 }

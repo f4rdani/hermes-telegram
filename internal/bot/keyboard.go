@@ -25,26 +25,14 @@ func CancelKeyboard() tgbotapi.InlineKeyboardMarkup {
 	)
 }
 
-func ModelKeyboard(currentModel string) tgbotapi.InlineKeyboardMarkup {
-	models := []struct {
-		Name  string
-		Label string
-	}{
-		{"smart-assistant", "🚀 smart-assistant (GoGate Default)"},
-		{"gemini-3.1-flash-lite", "⚡ Gemini 3.1 Flash Lite"},
-		{"gemini-3.5-flash-lite", "⚡ Gemini 3.5 Flash Lite"},
-		{"nemotron-3-ultra:cloud", "🧠 Nemotron 3 Ultra (Ollama Cloud)"},
-		{"mimo-v2.5-free", "✨ MiMo v2.5 Free (OpenCode Zen)"},
-		{"9router", "🔄 9router (Local 9router)"},
-	}
-
+func ModelKeyboard(currentModel string, models []ModelInfo) tgbotapi.InlineKeyboardMarkup {
 	var rows [][]tgbotapi.InlineKeyboardButton
 	for _, m := range models {
 		label := m.Label
-		if m.Name == currentModel {
+		if m.ID == currentModel {
 			label = "✓ " + label
 		}
-		btn := tgbotapi.NewInlineKeyboardButtonData(label, "set_model:"+m.Name)
+		btn := tgbotapi.NewInlineKeyboardButtonData(label, "set_model:"+m.ID)
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(btn))
 	}
 	rows = append(rows, tgbotapi.NewInlineKeyboardRow(DismissButton()))

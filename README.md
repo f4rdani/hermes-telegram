@@ -137,8 +137,11 @@ Edit file `config.json` menggunakan text editor kesukaan Anda (`nano`, `vim`, at
   },
   "hermes": {
     "binary_path": "/usr/local/bin/hermes",
-    "default_model": "9router",
-    "working_dir": "/root"
+    "default_model": "smart-assistant",
+    "working_dir": "/root",
+    "gateway_url": "http://127.0.0.1:8080",
+    "gateway_name": "GoGate",
+    "gateway_key": "sk-gogate-vps-master-key"
   }
 }
 ```
@@ -247,8 +250,11 @@ Agar bot berjalan otomatis di latar belakang dan selalu menyala kembali jika ser
 | `telegram.bot_token` | `string` | **Ya** | Token Bot API dari Telegram [@BotFather](https://t.me/BotFather). |
 | `telegram.allowed_user_ids` | `array[int]` | **Ya** | Daftar ID Telegram pengguna yang diizinkan mengakses bot. |
 | `hermes.binary_path` | `string` | Tidak | Path absolut binary Hermes Agent CLI (default: `/usr/local/bin/hermes`). |
-| `hermes.default_model` | `string` | Tidak | Nama model default yang digunakan oleh Hermes CLI. |
+| `hermes.default_model` | `string` | Tidak | Nama model default (default: `smart-assistant`). |
 | `hermes.working_dir` | `string` | Tidak | Direktori kerja (*working directory*) saat proses Hermes dieksekusi. |
+| `hermes.gateway_url` | `string` | Tidak | URL OpenAI-compatible API Gateway (default: `http://127.0.0.1:8080`). |
+| `hermes.gateway_name` | `string` | Tidak | Nama label gateway yang ditampilkan pada bot (default: `GoGate`). |
+| `hermes.gateway_key` | `string` | Tidak | Master API Key untuk query endpoint `/v1/models` (opsional). |
 
 ---
 

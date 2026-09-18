@@ -30,11 +30,12 @@ func ModelKeyboard(currentModel string) tgbotapi.InlineKeyboardMarkup {
 		Name  string
 		Label string
 	}{
-		{"9router", "9router (Auto-Combo Default)"},
-		{"Es/qwen3.8-flash", "Qwen 3.8 Flash"},
-		{"Es/deepseek-v3.2", "DeepSeek V3.2"},
-		{"Es/kimi-k3", "Kimi K3 (1M Context)"},
-		{"Es/qwen3.6-27b", "Qwen 3.6 27B"},
+		{"smart-assistant", "🚀 smart-assistant (GoGate Default)"},
+		{"gemini-3.1-flash-lite", "⚡ Gemini 3.1 Flash Lite"},
+		{"gemini-3.5-flash-lite", "⚡ Gemini 3.5 Flash Lite"},
+		{"nemotron-3-ultra:cloud", "🧠 Nemotron 3 Ultra (Ollama Cloud)"},
+		{"mimo-v2.5-free", "✨ MiMo v2.5 Free (OpenCode Zen)"},
+		{"9router", "🔄 9router (Local 9router)"},
 	}
 
 	var rows [][]tgbotapi.InlineKeyboardButton

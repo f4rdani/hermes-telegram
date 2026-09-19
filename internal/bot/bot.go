@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -696,7 +697,8 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 	log.Printf("[bot] Task starting for User %d (Session: %s, Model: %s)",
 		userID, userSess.CurrentSessionID, userSess.CurrentModel)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	taskTimeout := 15 * time.Minute
+	ctx, cancel := context.WithTimeout(context.Background(), taskTimeout)
 	defer cancel()
 
 	opts := engine.RunOptions{
@@ -708,6 +710,7 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 		Yolo:            userSess.YoloMode,
 		PreloadSkills:   preloadSkills,
 		WorkingDir:      s.cfg.Hermes.WorkingDir,
+		Timeout:         taskTimeout,
 		OnProgress: func(displayText string) {
 			if hasStatusMsg {
 				_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, displayText, &cancelKb)
@@ -721,12 +724,54 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 
 	if runErr != nil {
 		log.Printf("[bot] Task error (%v): %v", duration, runErr)
-		errMsg := fmt.Sprintf("❌ *Gagal Mengeksekusi Tugas (%v):*\n\n```\n%v\n```", duration, runErr)
-		if hasStatusMsg {
-			_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, errMsg, nil)
+
+		var sb strings.Builder
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) || strings.Contains(runErr.Error(), "timeout") {
+			sb.WriteString(fmt.Sprintf("⏱️ *Batas Waktu Eksekusi Terlampaui (Timeout %v)*\n\n_Operasi dihentikan otomatis karena mencapai batas waktu maksimal._\n\n", duration))
+		} else if strings.Contains(runErr.Error(), "dibatalkan") {
+			sb.WriteString("🛑 *Operasi Dibatalkan oleh Pengguna*\n\n")
 		} else {
-			sent, _ := SendSafeMessage(s.bot, chatID, errMsg, nil)
-			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			sb.WriteString(fmt.Sprintf("❌ *Gagal Mengeksekusi Tugas (%v):*\n\n```\n%v\n```\n\n", duration, runErr))
+		}
+
+		if result != nil && len(result.ToolHistory) > 0 {
+			sb.WriteString("⚙️ *Aktivitas Tools Terakhir:*\n")
+			start := 0
+			if len(result.ToolHistory) > 6 {
+				start = len(result.ToolHistory) - 6
+			}
+			for _, th := range result.ToolHistory[start:] {
+				sb.WriteString(fmt.Sprintf("• %s\n", th))
+			}
+			sb.WriteString("\n")
+		}
+
+		if result != nil && strings.TrimSpace(result.FinalText) != "" {
+			sb.WriteString("💬 *Catatan/Keluaran Terakhir Sebelum Terhenti:*\n")
+			sb.WriteString(strings.TrimSpace(result.FinalText))
+			sb.WriteString("\n")
+		}
+
+		activeSessionID := userSess.CurrentSessionID
+		if result != nil && result.SessionID != "" {
+			activeSessionID = result.SessionID
+		}
+		footer := s.formatResultFooter(duration, result, activeSessionID)
+		sb.WriteString(footer)
+
+		errMsg := sb.String()
+		chunks := SplitMessage(errMsg, 4000)
+		if hasStatusMsg && len(chunks) > 0 {
+			_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, chunks[0], nil)
+			for _, chunk := range chunks[1:] {
+				sent, _ := SendSafeMessage(s.bot, chatID, chunk, nil)
+				s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			}
+		} else {
+			for _, chunk := range chunks {
+				sent, _ := SendSafeMessage(s.bot, chatID, chunk, nil)
+				s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			}
 		}
 		s.pruneOldTelegramMessages(chatID, userID)
 		s.checkAndRunNextQueuedTask(userID)

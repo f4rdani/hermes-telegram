@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +24,7 @@ type RunOptions struct {
 	Yolo            bool
 	PreloadSkills   string
 	WorkingDir      string
+	Timeout         time.Duration
 	OnProgress      func(displayText string)
 }
 
@@ -116,6 +119,12 @@ func (r *Runner) Execute(ctx context.Context, userID int64, opts RunOptions) (*R
 	}
 	if opts.WorkingDir != "" {
 		args = append(args, "--in", opts.WorkingDir)
+	}
+	if opts.Timeout > 0 {
+		budgetSec := int(opts.Timeout.Seconds()) - 60
+		if budgetSec > 30 {
+			args = append(args, "--run-budget", strconv.Itoa(budgetSec))
+		}
 	}
 
 	log.Printf("[engine] Executing hermes for user %d (session=%s, model=%s)", userID, opts.SessionID, opts.Model)
@@ -266,15 +275,35 @@ func (r *Runner) Execute(ctx context.Context, userID int64, opts RunOptions) (*R
 
 	cmdErr := cmd.Wait()
 
-	if runCtx.Err() == context.Canceled {
+	if errors.Is(runCtx.Err(), context.Canceled) {
 		return nil, fmt.Errorf("operasi dibatalkan oleh pengguna")
 	}
 
+	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+		partialText := strings.TrimSpace(accumulatedText.String())
+		return &RunResult{
+			SessionID:   sessionID,
+			FinalText:   partialText,
+			ExitCode:    124,
+			Error:       "timeout: batas waktu eksekusi terlampaui",
+			ToolHistory: toolHistory,
+		}, fmt.Errorf("batas waktu eksekusi tercapai (timeout %v)", opts.Timeout)
+	}
+
 	if resultObj == nil {
-		finalStr := accumulatedText.String()
+		finalStr := strings.TrimSpace(accumulatedText.String())
 		stderrStr := strings.TrimSpace(stderrBuf.String())
 
-		if cmdErr != nil && finalStr == "" {
+		if cmdErr != nil {
+			if finalStr != "" {
+				return &RunResult{
+					SessionID:   sessionID,
+					FinalText:   finalStr,
+					ExitCode:    1,
+					Error:       fmt.Sprintf("hermes error (%v): %s", cmdErr, stderrStr),
+					ToolHistory: toolHistory,
+				}, fmt.Errorf("hermes error (%v): %s", cmdErr, stderrStr)
+			}
 			return nil, fmt.Errorf("hermes error (%v): %s", cmdErr, stderrStr)
 		}
 

@@ -1,6 +1,8 @@
 package bot
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -722,16 +724,180 @@ func (h *CommandHandler) HandleCompress(bot *tgbotapi.BotAPI, chatID, userID int
 	}
 
 	arg = strings.TrimSpace(arg)
-	reply := fmt.Sprintf(
-		"🗜️ *Status Kompresi Konteks Sesi (`%s`)*\n\n"+
-			"• *Jumlah Pesan Saat Ini:* %d\n"+
-			"• *Total Token Konteks:* %d\n"+
-			"• *Estimasi Pengurangan:* ~50-70%%\n\n"+
-			"💡 _Untuk mereset riwayat sepenuhnya dan mulai segar, gunakan `/new`._",
+
+	// Send initial status message
+	statusMsg, err := SendSafeMessage(bot, chatID, fmt.Sprintf(
+		"🗜️ *Memproses Kompresi Sesi (`%s`)...*\n\n"+
+			"• *Jumlah Pesan:* %d\n"+
+			"• *Estimasi Token:* %d\n\n"+
+			"⏳ _Aida sedang merangkum riwayat percakapan untuk menghemat ruang memori. Mohon tunggu beberapa saat..._",
 		det.ID, det.MessageCount, det.InputTokens+det.OutputTokens,
-	)
-	dismissKb := DismissKeyboard()
-	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+	), nil)
+	hasStatus := (err == nil)
+	if hasStatus {
+		h.sessMgr.AddTelegramMsgID(userID, statusMsg.MessageID)
+	}
+
+	go func(targetSessionID string) {
+		scriptPath := "/root/apps/hermes-tele/scripts/compress_session.py"
+		pyArgs := []string{scriptPath, "--session-id", targetSessionID}
+		if arg != "" {
+			pyArgs = append(pyArgs, strings.Fields(arg)...)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+
+		cmd := exec.CommandContext(ctx, "/usr/local/lib/hermes-agent/venv/bin/python", pyArgs...)
+		cmd.Env = append(os.Environ(), "PYTHONPATH=/usr/local/lib/hermes-agent")
+		out, runErr := cmd.Output()
+		if runErr != nil {
+			errMsg := fmt.Sprintf("❌ *Gagal Mengompres Sesi:*\n```\n%v\n```", runErr)
+			if hasStatus {
+				_, _ = EditSafeMessage(bot, chatID, statusMsg.MessageID, errMsg, nil)
+			} else {
+				_, _ = SendSafeMessage(bot, chatID, errMsg, nil)
+			}
+			return
+		}
+
+		var res struct {
+			Success           bool     `json:"success"`
+			Status            string   `json:"status"`
+			OriginalSessionID string   `json:"original_session_id"`
+			NewSessionID      string   `json:"new_session_id"`
+			BeforeMessages    int      `json:"before_messages"`
+			AfterMessages     int      `json:"after_messages"`
+			BeforeTokens      int      `json:"before_tokens"`
+			AfterTokens       int      `json:"after_tokens"`
+			RemovedMessages   int      `json:"removed_messages"`
+			Lines             []string `json:"lines"`
+			Message           string   `json:"message"`
+		}
+
+		if err := json.Unmarshal(out, &res); err != nil {
+			errMsg := fmt.Sprintf("❌ *Gagal Membaca Hasil Kompresi:*\n%s", string(out))
+			if hasStatus {
+				_, _ = EditSafeMessage(bot, chatID, statusMsg.MessageID, errMsg, nil)
+			} else {
+				_, _ = SendSafeMessage(bot, chatID, errMsg, nil)
+			}
+			return
+		}
+
+		if !res.Success {
+			errMsg := fmt.Sprintf("ℹ️ *Status Kompresi:*\n%s", res.Message)
+			dismissKb := DismissKeyboard()
+			if hasStatus {
+				_, _ = EditSafeMessage(bot, chatID, statusMsg.MessageID, errMsg, &dismissKb)
+			} else {
+				_, _ = SendSafeMessage(bot, chatID, errMsg, dismissKb)
+			}
+			return
+		}
+
+		if res.Status == "preview" {
+			previewText := fmt.Sprintf("🗜️ *Pratinjau Kompresi Sesi (`%s`):*\n\n%s", targetSessionID, strings.Join(res.Lines, "\n"))
+			dismissKb := DismissKeyboard()
+			if hasStatus {
+				_, _ = EditSafeMessage(bot, chatID, statusMsg.MessageID, previewText, &dismissKb)
+			} else {
+				_, _ = SendSafeMessage(bot, chatID, previewText, dismissKb)
+			}
+			return
+		}
+
+		if res.Status == "compressed" {
+			if res.NewSessionID != "" && res.NewSessionID != targetSessionID {
+				h.sessMgr.SetSessionID(userID, res.NewSessionID)
+			}
+
+			reductionPct := 0.0
+			if res.BeforeTokens > 0 {
+				reductionPct = float64(res.BeforeTokens-res.AfterTokens) / float64(res.BeforeTokens) * 100.0
+			}
+
+			reply := fmt.Sprintf(
+				"✅ *Kompresi Konteks Berhasil!*\n\n"+
+					"• *Sesi:* `%s`\n"+
+					"• *Pesan:* %d ➔ %d (%d pesan diringkas)\n"+
+					"• *Estimasi Token:* %d ➔ %d (Hemat ~%.1f%%)\n\n"+
+					"💡 _Riwayat ringkasan telah disimpan ke dalam sesi. Percakapan selanjutnya berlanjut di sesi ini!_",
+				res.NewSessionID, res.BeforeMessages, res.AfterMessages, res.RemovedMessages,
+				res.BeforeTokens, res.AfterTokens, reductionPct,
+			)
+			dismissKb := DismissKeyboard()
+			if hasStatus {
+				_, _ = EditSafeMessage(bot, chatID, statusMsg.MessageID, reply, &dismissKb)
+			} else {
+				_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+			}
+			return
+		}
+
+		reply := fmt.Sprintf("ℹ️ *Kompresi Selesai (%s):*\n%s", res.Status, strings.Join(res.Lines, "\n"))
+		dismissKb := DismissKeyboard()
+		if hasStatus {
+			_, _ = EditSafeMessage(bot, chatID, statusMsg.MessageID, reply, &dismissKb)
+		} else {
+			_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+		}
+	}(s.CurrentSessionID)
+}
+
+func (h *CommandHandler) HandleSendFile(bot *tgbotapi.BotAPI, chatID, userID int64, filePath string) {
+	filePath = strings.TrimSpace(filePath)
+	filePath = strings.Trim(filePath, "`\"'")
+
+	if filePath == "" {
+		reply := "📤 *Kirim File ke Telegram:*\n\nFormat: `/sendfile /path/ke/file` atau `/send /path/ke/file`\n\nContoh:\n`/sendfile /tmp/pesan_aida.txt`"
+		dismissKb := DismissKeyboard()
+		sent, _ := SendSafeMessage(bot, chatID, reply, dismissKb)
+		h.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+		return
+	}
+
+	info, err := os.Stat(filePath)
+	if err != nil {
+		reply := fmt.Sprintf("❌ *File tidak ditemukan:*\n`%s`\n\nPastikan jalur file lokal di VPS sudah benar.", filePath)
+		dismissKb := DismissKeyboard()
+		sent, _ := SendSafeMessage(bot, chatID, reply, dismissKb)
+		h.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+		return
+	}
+
+	if info.IsDir() {
+		reply := fmt.Sprintf("⚠️ *Jalur adalah folder/direktori:*\n`%s`\n\nHanya file tunggal yang dapat dikirim.", filePath)
+		dismissKb := DismissKeyboard()
+		sent, _ := SendSafeMessage(bot, chatID, reply, dismissKb)
+		h.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+		return
+	}
+
+	fileName := filepath.Base(filePath)
+	if isImageFile(filePath) {
+		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FilePath(filePath))
+		photo.Caption = fmt.Sprintf("🖼️ %s", fileName)
+		sent, err := bot.Send(photo)
+		if err != nil {
+			reply := fmt.Sprintf("❌ Gagal mengirim gambar: %v", err)
+			sMsg, _ := SendSafeMessage(bot, chatID, reply, nil)
+			h.sessMgr.AddTelegramMsgID(userID, sMsg.MessageID)
+			return
+		}
+		h.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+	} else {
+		doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(filePath))
+		doc.Caption = fmt.Sprintf("📎 %s", fileName)
+		sent, err := bot.Send(doc)
+		if err != nil {
+			reply := fmt.Sprintf("❌ Gagal mengirim dokumen: %v", err)
+			sMsg, _ := SendSafeMessage(bot, chatID, reply, nil)
+			h.sessMgr.AddTelegramMsgID(userID, sMsg.MessageID)
+			return
+		}
+		h.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+	}
 }
 
 func (h *CommandHandler) HandleRestart(bot *tgbotapi.BotAPI, chatID int64) {

@@ -342,6 +342,8 @@ func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
 		s.cmdHandler.HandleDeny(s.bot, chatID, userID, arg)
 	case "/compress", "/compact":
 		s.cmdHandler.HandleCompress(s.bot, chatID, userID, arg)
+	case "/sendfile", "/send":
+		s.cmdHandler.HandleSendFile(s.bot, chatID, userID, arg)
 	case "/restart":
 		s.cmdHandler.HandleRestart(s.bot, chatID)
 	case "/update":
@@ -791,6 +793,9 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 	if finalText == "" {
 		finalText = fmt.Sprintf("✅ *Tugas selesai dalam %v tanpa keluaran teks.*", duration)
 	}
+
+	// Intercept and send any outbound files/images (MEDIA:<path>, FILE:<path>, etc.) directly to Telegram!
+	finalText = s.ProcessOutboundMedia(chatID, userID, finalText)
 
 	activeSessionID := userSess.CurrentSessionID
 	if result != nil && result.SessionID != "" {

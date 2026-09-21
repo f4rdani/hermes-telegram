@@ -62,6 +62,8 @@ def main():
             session_id=session_id,
             session_db=db
         )
+        if getattr(agent, "context_compressor", None):
+            agent.context_compressor.summary_model = "geminiflash"
 
         import io
         import contextlib

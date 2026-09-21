@@ -745,14 +745,18 @@ func (h *CommandHandler) HandleCompress(bot *tgbotapi.BotAPI, chatID, userID int
 			pyArgs = append(pyArgs, strings.Fields(arg)...)
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 
 		cmd := exec.CommandContext(ctx, "/usr/local/lib/hermes-agent/venv/bin/python", pyArgs...)
 		cmd.Env = append(os.Environ(), "PYTHONPATH=/usr/local/lib/hermes-agent")
 		out, runErr := cmd.Output()
 		if runErr != nil {
-			errMsg := fmt.Sprintf("❌ *Gagal Mengompres Sesi:*\n```\n%v\n```", runErr)
+			errDetail := runErr.Error()
+			if exitErr, ok := runErr.(*exec.ExitError); ok && len(exitErr.Stderr) > 0 {
+				errDetail = fmt.Sprintf("%s\n%s", errDetail, string(exitErr.Stderr))
+			}
+			errMsg := fmt.Sprintf("❌ *Gagal Mengompres Sesi:*\n```\n%v\n```", errDetail)
 			if hasStatus {
 				_, _ = EditSafeMessage(bot, chatID, statusMsg.MessageID, errMsg, nil)
 			} else {

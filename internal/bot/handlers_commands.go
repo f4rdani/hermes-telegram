@@ -915,13 +915,25 @@ func (h *CommandHandler) HandleRestart(bot *tgbotapi.BotAPI, chatID int64) {
 func (h *CommandHandler) HandleUpdate(bot *tgbotapi.BotAPI, chatID int64, arg string) {
 	arg = strings.TrimSpace(arg)
 	if arg == "now" || arg == "--yes" {
-		_, _ = SendSafeMessage(bot, chatID, "⏳ *Sedang memeriksa dan memperbarui Hermes Agent...*", nil)
-		out, err := exec.Command(h.cfg.Hermes.BinaryPath, "update", "--yes").CombinedOutput()
-		if err != nil {
-			_, _ = SendSafeMessage(bot, chatID, fmt.Sprintf("❌ Gagal memperbarui: %v\n\n```\n%s\n```", err, string(out)), nil)
-			return
-		}
-		_, _ = SendSafeMessage(bot, chatID, fmt.Sprintf("✅ *Pembaruan Selesai:*\n\n```\n%s\n```", string(out)), nil)
+		_, _ = SendSafeMessage(bot, chatID, "⏳ *Sedang memeriksa dan memperbarui Hermes Agent...*\n_Proses berjalan di latar belakang (bisa memakan waktu 1-3 menit). Gateway akan otomatis restart setelah selesai._", nil)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+
+			cmd := exec.CommandContext(ctx, h.cfg.Hermes.BinaryPath, "update", "--yes")
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				_, _ = SendSafeMessage(bot, chatID, fmt.Sprintf("❌ *Gagal memperbarui Hermes Agent:* %v\n\n```\n%s\n```", err, string(out)), nil)
+				return
+			}
+			outStr := string(out)
+			if len(outStr) > 3500 {
+				outStr = outStr[len(outStr)-3500:]
+			}
+			_, _ = SendSafeMessage(bot, chatID, fmt.Sprintf("✅ *Pembaruan Hermes Agent Selesai:*\n\n```\n%s\n```\n_Memulai ulang layanan hermes-tele..._", outStr), nil)
+			time.Sleep(1 * time.Second)
+			_ = exec.Command("systemctl", "restart", "hermes-tele.service").Run()
+		}()
 		return
 	}
 

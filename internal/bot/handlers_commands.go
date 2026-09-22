@@ -915,36 +915,86 @@ func (h *CommandHandler) HandleRestart(bot *tgbotapi.BotAPI, chatID int64) {
 func (h *CommandHandler) HandleUpdate(bot *tgbotapi.BotAPI, chatID int64, arg string) {
 	arg = strings.TrimSpace(arg)
 	if arg == "now" || arg == "--yes" {
-		_, _ = SendSafeMessage(bot, chatID, "⏳ *Sedang memeriksa dan memperbarui Hermes Agent...*\n_Proses berjalan di latar belakang (bisa memakan waktu 1-3 menit). Gateway akan otomatis restart setelah selesai._", nil)
+		statusMsg, _ := SendSafeMessage(bot, chatID, "⏳ *Sedang memeriksa dan memperbarui Hermes Agent...*\n\n⏱️ _Mengambil pembaruan terbaru & menyinkronkan dependensi..._\n_Gateway akan otomatis restart setelah selesai._", nil)
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
 
+			// Periodic live update ticker so user knows it's actively working
+			stopTicker := make(chan struct{})
+			startTime := time.Now()
+			go func() {
+				ticker := time.NewTicker(4 * time.Second)
+				defer ticker.Stop()
+				phases := []string{
+					"📥 _Mengunduh perubahan kode dari repositori..._",
+					"📦 _Memperbarui dependensi Python & virtualenv..._",
+					"🧹 _Membersihkan cache dan modul usang..._",
+					"⚡ _Menyinkronkan bundled skills & catalog..._",
+				}
+				pIdx := 0
+				for {
+					select {
+					case <-stopTicker:
+						return
+					case <-ticker.C:
+						elapsed := time.Since(startTime).Round(time.Second)
+						phaseText := phases[pIdx%len(phases)]
+						pIdx++
+						editText := fmt.Sprintf("⏳ *Sedang memperbarui Hermes Agent...* `(%s)`\n\n%s\n\n_Mohon tunggu, gateway akan kembali online otomatis._", elapsed, phaseText)
+						_, _ = EditSafeMessage(bot, chatID, statusMsg.MessageID, editText, nil)
+					}
+				}
+			}()
+
 			cmd := exec.CommandContext(ctx, h.cfg.Hermes.BinaryPath, "update", "--yes")
 			out, err := cmd.CombinedOutput()
+			close(stopTicker)
+
 			if err != nil {
-				_, _ = SendSafeMessage(bot, chatID, fmt.Sprintf("❌ *Gagal memperbarui Hermes Agent:* %v\n\n```\n%s\n```", err, string(out)), nil)
+				_, _ = EditSafeMessage(bot, chatID, statusMsg.MessageID, fmt.Sprintf("❌ *Gagal memperbarui Hermes Agent:* %v\n\n```\n%s\n```", err, string(out)), nil)
 				return
 			}
+
 			outStr := string(out)
 			if len(outStr) > 3500 {
 				outStr = outStr[len(outStr)-3500:]
 			}
-			_, _ = SendSafeMessage(bot, chatID, fmt.Sprintf("✅ *Pembaruan Hermes Agent Selesai:*\n\n```\n%s\n```\n_Memulai ulang layanan hermes-tele..._", outStr), nil)
+
+			// Final completion notice with countdown to restart
+			finishNotice := fmt.Sprintf("✅ *Pembaruan Hermes Agent Selesai!*\n\n```\n%s\n```\n🔄 _Memulai ulang layanan hermes-tele. Bot akan online kembali dalam beberapa detik..._", outStr)
+			_, _ = EditSafeMessage(bot, chatID, statusMsg.MessageID, finishNotice, nil)
+
 			time.Sleep(1 * time.Second)
 			_ = exec.Command("systemctl", "restart", "hermes-tele.service").Run()
 		}()
 		return
 	}
 
-	out, err := exec.Command(h.cfg.Hermes.BinaryPath, "update", "--check").CombinedOutput()
-	res := strings.TrimSpace(string(out))
-	if err != nil || res == "" {
-		res = "Hermes Agent sudah menggunakan versi terkini."
-	}
-	reply := fmt.Sprintf("☤ *Pemeriksaan Pembaruan Hermes Agent*\n\n```\n%s\n```\n\n_Ketik `/update now` untuk menginstal pembaruan._", res)
-	dismissKb := DismissKeyboard()
-	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+	// Loading placeholder saat cek update
+	checkMsg, _ := SendSafeMessage(bot, chatID, "⏳ *Memeriksa pembaruan Hermes Agent ke origin...*", nil)
+
+	go func() {
+		out, err := exec.Command(h.cfg.Hermes.BinaryPath, "update", "--check").CombinedOutput()
+		res := strings.TrimSpace(string(out))
+		if err != nil || res == "" {
+			res = "Hermes Agent sudah menggunakan versi terkini."
+		}
+
+		reply := fmt.Sprintf("☤ *Pemeriksaan Pembaruan Hermes Agent*\n\n```\n%s\n```", res)
+		var kb *tgbotapi.InlineKeyboardMarkup
+
+		if strings.Contains(strings.ToLower(res), "update available") {
+			reply += "\n\n_Pembaruan tersedia! Klik tombol di bawah atau ketik `/update now`._"
+			markup := UpdateAvailableKeyboard()
+			kb = &markup
+		} else {
+			markup := DismissKeyboard()
+			kb = &markup
+		}
+
+		_, _ = EditSafeMessage(bot, chatID, checkMsg.MessageID, reply, kb)
+	}()
 }
 
 func (h *CommandHandler) HandleSave(bot *tgbotapi.BotAPI, chatID, userID int64, format string) {

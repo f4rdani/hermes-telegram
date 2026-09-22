@@ -193,6 +193,11 @@ func (s *BotServer) handleCallbackQuery(cb *tgbotapi.CallbackQuery) {
 		_, _ = s.bot.Send(tgbotapi.NewDeleteMessage(chatID, cb.Message.MessageID))
 		_, _ = s.bot.Request(tgbotapi.NewCallback(cb.ID, fmt.Sprintf("✅ Beralih ke sesi: %s", sessionID)))
 
+	case data == "run_update_now":
+		_, _ = s.bot.Send(tgbotapi.NewDeleteMessage(chatID, cb.Message.MessageID))
+		_, _ = s.bot.Request(tgbotapi.NewCallback(cb.ID, "🚀 Memulai pembaruan..."))
+		s.cmdHandler.HandleUpdate(s.bot, chatID, "now")
+
 	case data == "new_session":
 		s.sessMgr.ResetSession(userID)
 		// Delete menu message to keep the chat completely clean
@@ -268,6 +273,9 @@ func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
 	if len(parts) > 1 {
 		arg = strings.TrimSpace(parts[1])
 	}
+
+	// Immediate typing action feedback for all slash commands
+	_, _ = s.bot.Send(tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping))
 
 	switch cmd {
 	case "/start":

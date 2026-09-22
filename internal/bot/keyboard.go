@@ -18,10 +18,20 @@ func DismissKeyboard() tgbotapi.InlineKeyboardMarkup {
 	)
 }
 
+func CloseButton() tgbotapi.InlineKeyboardButton {
+	return tgbotapi.NewInlineKeyboardButtonData("✖️ Tutup", "dismiss_msg")
+}
+
+func CloseKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(CloseButton()),
+	)
+}
+
 func UpdateAvailableKeyboard() tgbotapi.InlineKeyboardMarkup {
 	updateBtn := tgbotapi.NewInlineKeyboardButtonData("🚀 Update Sekarang", "run_update_now")
 	return tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(updateBtn, DismissButton()),
+		tgbotapi.NewInlineKeyboardRow(updateBtn, CloseButton()),
 	)
 }
 

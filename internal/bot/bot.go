@@ -122,6 +122,8 @@ func (s *BotServer) Start(ctx context.Context) error {
 	log.Printf("[bot] Hermes Engine: %s | Default Model: %s | Workspace: %s",
 		s.cfg.Hermes.BinaryPath, s.cfg.Hermes.DefaultModel, s.cfg.Hermes.WorkingDir)
 
+	go s.CheckAndNotifyRestart()
+
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 

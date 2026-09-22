@@ -905,7 +905,12 @@ func (h *CommandHandler) HandleSendFile(bot *tgbotapi.BotAPI, chatID, userID int
 }
 
 func (h *CommandHandler) HandleRestart(bot *tgbotapi.BotAPI, chatID int64) {
-	_, _ = SendSafeMessage(bot, chatID, "🔄 *Memulai ulang gateway Hermes Telegram...*\nGateway akan kembali aktif dalam beberapa detik.", nil)
+	restartMsg, err := SendSafeMessage(bot, chatID, "🔄 *Memulai ulang gateway Hermes Telegram...*\nGateway akan kembali aktif dalam beberapa detik.", nil)
+	msgID := 0
+	if err == nil {
+		msgID = restartMsg.MessageID
+	}
+	SavePendingRestart(chatID, msgID, "restart", "")
 	go func() {
 		time.Sleep(600 * time.Millisecond)
 		_ = exec.Command("systemctl", "restart", "hermes-tele.service").Run()
@@ -952,18 +957,22 @@ func (h *CommandHandler) HandleUpdate(bot *tgbotapi.BotAPI, chatID int64, arg st
 			close(stopTicker)
 
 			if err != nil {
-				_, _ = EditSafeMessage(bot, chatID, statusMsg.MessageID, fmt.Sprintf("❌ *Gagal memperbarui Hermes Agent:* %v\n\n```\n%s\n```", err, string(out)), nil)
+				closeKb := CloseKeyboard()
+				_, _ = EditSafeMessage(bot, chatID, statusMsg.MessageID, fmt.Sprintf("❌ *Gagal memperbarui Hermes Agent:* %v\n\n```\n%s\n```", err, string(out)), &closeKb)
 				return
 			}
 
 			outStr := string(out)
-			if len(outStr) > 3500 {
-				outStr = outStr[len(outStr)-3500:]
+			if len(outStr) > 3000 {
+				outStr = outStr[len(outStr)-3000:]
 			}
 
-			// Final completion notice with countdown to restart
+			// Final completion notice before restart
 			finishNotice := fmt.Sprintf("✅ *Pembaruan Hermes Agent Selesai!*\n\n```\n%s\n```\n🔄 _Memulai ulang layanan hermes-tele. Bot akan online kembali dalam beberapa detik..._", outStr)
-			_, _ = EditSafeMessage(bot, chatID, statusMsg.MessageID, finishNotice, nil)
+			closeKb := CloseKeyboard()
+			_, _ = EditSafeMessage(bot, chatID, statusMsg.MessageID, finishNotice, &closeKb)
+
+			SavePendingRestart(chatID, statusMsg.MessageID, "update", outStr)
 
 			time.Sleep(1 * time.Second)
 			_ = exec.Command("systemctl", "restart", "hermes-tele.service").Run()
@@ -989,7 +998,7 @@ func (h *CommandHandler) HandleUpdate(bot *tgbotapi.BotAPI, chatID int64, arg st
 			markup := UpdateAvailableKeyboard()
 			kb = &markup
 		} else {
-			markup := DismissKeyboard()
+			markup := CloseKeyboard()
 			kb = &markup
 		}
 

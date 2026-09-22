@@ -49,100 +49,125 @@ func SplitMessage(text string, chunkSize int) []string {
 }
 
 var (
-	reFencedCode = regexp.MustCompile("(?s)```(\\w*)\n?(.*?)```")
-	reInlineCode = regexp.MustCompile("`([^`\n]+)`")
-	reHeader     = regexp.MustCompile(`(?m)^(#{1,6})\s+(.*)`)
-	reBold       = regexp.MustCompile(`\*\*(.+?)\*\*`)
-	reItalicUS   = regexp.MustCompile(`__(.+?)__`)
-	reItalicAst  = regexp.MustCompile(`\*([^\*\n]+)\*`)
-	reStrike     = regexp.MustCompile(`~~(.+?)~~`)
-	reTableRow   = regexp.MustCompile(`^\s*\|(.+)\|\s*$`)
-	reTableSep   = regexp.MustCompile(`^\s*\|?\s*(:?-+:?\s*\|)+\s*(:?-+:?)\s*\|?\s*$`)
+	reFencedCode   = regexp.MustCompile("(?s)```(\\w*)\n?(.*?)```")
+	reInlineCode   = regexp.MustCompile("`([^`\n]+)`")
+	reHeader       = regexp.MustCompile(`(?m)^(#{1,6})\s+(.*)`)
+	reBold         = regexp.MustCompile(`\*\*(.+?)\*\*`)
+	reItalicUS     = regexp.MustCompile(`__(.+?)__`)
+	reItalicAst    = regexp.MustCompile(`\*([^\*\n]+)\*`)
+	reStrike       = regexp.MustCompile(`~~(.+?)~~`)
+	reDashLine     = regexp.MustCompile(`^-{8,}$`)
+	reMultiSpace   = regexp.MustCompile(`\s{2,}`)
+	reStartsNum    = regexp.MustCompile(`^\d+\s`)
 )
 
-// formatTablesForLegacyHTML converts markdown tables into clean monospace ASCII tables inside <pre> tags.
-func formatTablesForLegacyHTML(text string) string {
-	lines := strings.Split(text, "\n")
+// ConvertASCIITablesToGFM detects ASCII text tables framed by dashed lines (---)
+// and converts them to standard GitHub Flavored Markdown (GFM) tables (| col1 | col2 |).
+// Telegram 12.9 natively renders GFM tables as beautiful visual UI tables.
+func ConvertASCIITablesToGFM(s string) string {
+	lines := strings.Split(s, "\n")
 	var out []string
-	var tableRows [][]string
-	inTable := false
+	i := 0
+	n := len(lines)
 
-	flushTable := func() {
-		if len(tableRows) == 0 {
-			return
+	for i < n {
+		line := lines[i]
+		trimmed := strings.TrimSpace(line)
+
+		hasTitle := false
+		title := ""
+		dashIdx := -1
+
+		if reDashLine.MatchString(trimmed) {
+			dashIdx = i
+		} else if i+1 < n && reDashLine.MatchString(strings.TrimSpace(lines[i+1])) {
+			hasTitle = true
+			title = trimmed
+			dashIdx = i + 1
 		}
-		cols := len(tableRows[0])
-		widths := make([]int, cols)
-		for _, row := range tableRows {
-			for i, cell := range row {
-				if i < cols {
-					runesLen := len([]rune(cell))
-					if runesLen > widths[i] {
-						widths[i] = runesLen
+
+		if dashIdx != -1 && dashIdx+2 < n && reDashLine.MatchString(strings.TrimSpace(lines[dashIdx+2])) {
+			headerLine := strings.TrimSpace(lines[dashIdx+1])
+			rawHeaders := reMultiSpace.Split(headerLine, -1)
+			var headers []string
+			for _, h := range rawHeaders {
+				if th := strings.TrimSpace(h); th != "" {
+					headers = append(headers, th)
+				}
+			}
+			numCols := len(headers)
+
+			if numCols >= 2 {
+				i = dashIdx + 3
+				var rows [][]string
+
+				for i < n && !reDashLine.MatchString(strings.TrimSpace(lines[i])) {
+					rowRaw := lines[i]
+					rowTrimmed := strings.TrimSpace(rowRaw)
+					if rowTrimmed != "" {
+						isContinuation := false
+						if len(rows) > 0 {
+							firstHeader := strings.ToLower(headers[0])
+							if strings.HasPrefix(rowRaw, "   ") || ((firstHeader == "no" || firstHeader == "id" || firstHeader == "#") && !reStartsNum.MatchString(rowTrimmed)) {
+								isContinuation = true
+							}
+						}
+
+						if isContinuation && len(rows) > 0 {
+							lastRow := rows[len(rows)-1]
+							lastRow[len(lastRow)-1] += " " + rowTrimmed
+						} else {
+							rawParts := reMultiSpace.Split(rowTrimmed, -1)
+							var parts []string
+							for _, p := range rawParts {
+								if tp := strings.TrimSpace(p); tp != "" {
+									parts = append(parts, tp)
+								}
+							}
+							if len(parts) > numCols {
+								mergedLast := strings.Join(parts[numCols-1:], " ")
+								parts = append(parts[:numCols-1], mergedLast)
+							}
+							for len(parts) < numCols {
+								parts = append(parts, "")
+							}
+							rows = append(rows, parts)
+						}
 					}
+					i++
 				}
-			}
-		}
 
-		out = append(out, "<pre>")
-		for rowIdx, row := range tableRows {
-			var lineParts []string
-			for i := 0; i < cols; i++ {
-				val := ""
-				if i < len(row) {
-					val = row[i]
+				if i < n && reDashLine.MatchString(strings.TrimSpace(lines[i])) {
+					i++
 				}
-				pad := widths[i] - len([]rune(val))
-				if pad < 0 {
-					pad = 0
+
+				if hasTitle && title != "" {
+					out = append(out, "### "+title+"\n")
 				}
-				lineParts = append(lineParts, val+strings.Repeat(" ", pad))
-			}
-			out = append(out, strings.Join(lineParts, " | "))
-			if rowIdx == 0 {
+				out = append(out, "| "+strings.Join(headers, " | ")+" |")
 				var seps []string
-				for _, w := range widths {
-					seps = append(seps, strings.Repeat("-", w))
+				for k := 0; k < numCols; k++ {
+					seps = append(seps, "---")
 				}
-				out = append(out, strings.Join(seps, "-+-"))
-			}
-		}
-		out = append(out, "</pre>")
-		tableRows = nil
-	}
-
-	for _, line := range lines {
-		if m := reTableRow.FindStringSubmatch(line); m != nil {
-			if reTableSep.MatchString(line) {
+				out = append(out, "| "+strings.Join(seps, " | ")+" |")
+				for _, r := range rows {
+					out = append(out, "| "+strings.Join(r, " | ")+" |")
+				}
+				out = append(out, "")
 				continue
 			}
-			rawCells := strings.Split(m[1], "|")
-			var cells []string
-			for _, c := range rawCells {
-				cells = append(cells, strings.TrimSpace(c))
-			}
-			tableRows = append(tableRows, cells)
-			inTable = true
-		} else {
-			if inTable {
-				flushTable()
-				inTable = false
-			}
-			out = append(out, line)
 		}
+
+		out = append(out, line)
+		i++
 	}
-	if inTable {
-		flushTable()
-	}
+
 	return strings.Join(out, "\n")
 }
 
 // MarkdownToTelegramHTML converts standard Markdown (GFM) to Telegram-safe HTML for legacy clients.
 func MarkdownToTelegramHTML(text string) string {
-	// 1. Convert markdown tables to clean monospace ASCII tables first
-	text = formatTablesForLegacyHTML(text)
-
-	// 2. Extract and protect fenced code blocks
+	// 1. Extract and protect fenced code blocks
 	var codeBlocks []string
 	text = reFencedCode.ReplaceAllStringFunc(text, func(match string) string {
 		parts := reFencedCode.FindStringSubmatch(match)
@@ -165,16 +190,7 @@ func MarkdownToTelegramHTML(text string) string {
 		return placeholder
 	})
 
-	// Also protect any <pre> blocks generated by formatTablesForLegacyHTML
-	rePre := regexp.MustCompile("(?s)<pre>.*?</pre>")
-	var preBlocks []string
-	text = rePre.ReplaceAllStringFunc(text, func(match string) string {
-		placeholder := "<<PRE_" + string(rune('A'+len(preBlocks))) + ">>"
-		preBlocks = append(preBlocks, match)
-		return placeholder
-	})
-
-	// 3. Extract and protect inline codes
+	// 2. Extract and protect inline codes
 	var inlineCodes []string
 	text = reInlineCode.ReplaceAllStringFunc(text, func(match string) string {
 		parts := reInlineCode.FindStringSubmatch(match)
@@ -184,36 +200,32 @@ func MarkdownToTelegramHTML(text string) string {
 		return placeholder
 	})
 
-	// 4. Escape remaining HTML entities
+	// 3. Escape remaining HTML entities
 	text = html.EscapeString(text)
 
-	// 5. Convert Headers (#, ##, ###) to <b>Header</b>\n
+	// 4. Convert Headers (#, ##, ###) to <b>Header</b>\n
 	text = reHeader.ReplaceAllString(text, "<b>$2</b>")
 
-	// 6. Convert **bold** to <b>bold</b>
+	// 5. Convert **bold** to <b>bold</b>
 	text = reBold.ReplaceAllString(text, "<b>$1</b>")
 
-	// 7. Convert __italic__ to <i>italic</i>
+	// 6. Convert __italic__ to <i>italic</i>
 	text = reItalicUS.ReplaceAllString(text, "<i>$1</i>")
 
-	// 8. Convert *italic* to <i>italic</i>
+	// 7. Convert *italic* to <i>italic</i>
 	text = reItalicAst.ReplaceAllString(text, "<i>$1</i>")
 
-	// 9. Convert ~~strikethrough~~ to <s>strikethrough</s>
+	// 8. Convert ~~strikethrough~~ to <s>strikethrough</s>
 	text = reStrike.ReplaceAllString(text, "<s>$1</s>")
 
-	// 10. Convert [text](url) to <a href="url">text</a>
+	// 9. Convert [text](url) to <a href="$2">$1</a>
 	reLink := regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
 	text = reLink.ReplaceAllString(text, `<a href="$2">$1</a>`)
 
-	// 11. Restore protected blocks
+	// 10. Restore protected blocks
 	for i, cb := range codeBlocks {
 		placeholder := "<<CB_" + string(rune('A'+i)) + ">>"
 		text = strings.Replace(text, placeholder, cb, 1)
-	}
-	for i, pb := range preBlocks {
-		placeholder := "<<PRE_" + string(rune('A'+i)) + ">>"
-		text = strings.Replace(text, placeholder, pb, 1)
 	}
 	for i, ic := range inlineCodes {
 		placeholder := "<<IC_" + string(rune('A'+i)) + ">>"
@@ -226,6 +238,9 @@ func MarkdownToTelegramHTML(text string) string {
 // SendRichMessage sends a rich message using Telegram 12.9+ Bot API 10.x sendRichMessage.
 // Supports native visual tables, headings, LaTeX math, blockquotes, checklists, up to 32,768 chars.
 func SendRichMessage(bot *tgbotapi.BotAPI, chatID int64, markdown string, replyMarkup interface{}) (tgbotapi.Message, error) {
+	// Auto-convert any legacy plain ASCII dash tables into native GFM tables so Telegram renders them visually
+	markdown = ConvertASCIITablesToGFM(markdown)
+
 	richJSON, err := json.Marshal(map[string]interface{}{
 		"markdown": markdown,
 	})
@@ -237,11 +252,7 @@ func SendRichMessage(bot *tgbotapi.BotAPI, chatID int64, markdown string, replyM
 		"chat_id":      strconv.FormatInt(chatID, 10),
 		"rich_message": string(richJSON),
 	}
-	if replyMarkup != nil {
-		if rmJSON, err := json.Marshal(replyMarkup); err == nil {
-			params["reply_markup"] = string(rmJSON)
-		}
-	}
+	_ = params.AddInterface("reply_markup", replyMarkup)
 
 	apiResp, err := bot.MakeRequest("sendRichMessage", params)
 	if err != nil {
@@ -257,6 +268,9 @@ func SendRichMessage(bot *tgbotapi.BotAPI, chatID int64, markdown string, replyM
 
 // EditRichMessage edits an existing message using Telegram 12.9+ Bot API 10.x editMessageText with rich_message.
 func EditRichMessage(bot *tgbotapi.BotAPI, chatID int64, messageID int, markdown string, replyMarkup interface{}) (tgbotapi.Message, error) {
+	// Auto-convert any legacy plain ASCII dash tables into native GFM tables so Telegram renders them visually
+	markdown = ConvertASCIITablesToGFM(markdown)
+
 	richJSON, err := json.Marshal(map[string]interface{}{
 		"markdown": markdown,
 	})
@@ -269,11 +283,7 @@ func EditRichMessage(bot *tgbotapi.BotAPI, chatID int64, messageID int, markdown
 		"message_id":   strconv.Itoa(messageID),
 		"rich_message": string(richJSON),
 	}
-	if replyMarkup != nil {
-		if rmJSON, err := json.Marshal(replyMarkup); err == nil {
-			params["reply_markup"] = string(rmJSON)
-		}
-	}
+	_ = params.AddInterface("reply_markup", replyMarkup)
 
 	apiResp, err := bot.MakeRequest("editMessageText", params)
 	if err != nil {

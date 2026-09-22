@@ -772,7 +772,7 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 		sb.WriteString(footer)
 
 		errMsg := sb.String()
-		chunks := SplitMessage(errMsg, 4000)
+		chunks := SplitMessage(errMsg, 30000)
 		if hasStatusMsg && len(chunks) > 0 {
 			_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, chunks[0], nil)
 			for _, chunk := range chunks[1:] {
@@ -815,8 +815,8 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 	footer := s.formatResultFooter(duration, result, activeSessionID)
 	fullResponse := finalText + footer
 
-	// Deliver response chunks (Telegram limit 4096)
-	chunks := SplitMessage(fullResponse, 4000)
+	// Deliver response chunks (Telegram 12.9 Rich Message limit 32768, safe margin 30000)
+	chunks := SplitMessage(fullResponse, 30000)
 	if hasStatusMsg && len(chunks) > 0 {
 		_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, chunks[0], nil)
 		for _, chunk := range chunks[1:] {

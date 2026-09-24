@@ -26,7 +26,7 @@ type ModelResolver struct {
 
 func NewModelResolver(gatewayURL, gatewayKey string) *ModelResolver {
 	if gatewayURL == "" {
-		gatewayURL = "http://127.0.0.1:8080"
+		gatewayURL = "http://127.0.0.1:20128"
 	}
 	return &ModelResolver{
 		gatewayURL: gatewayURL,
@@ -62,7 +62,7 @@ func (r *ModelResolver) GetModels(cfg *config.Config, currentModel string) []Mod
 	models := r.fetchFromGateway(cfg)
 	if len(models) == 0 {
 		// Dynamic minimal fallback based on current configuration
-		defModel := "smart-assistant"
+		defModel := "Top"
 		if cfg != nil && cfg.Hermes.DefaultModel != "" {
 			defModel = cfg.Hermes.DefaultModel
 		}

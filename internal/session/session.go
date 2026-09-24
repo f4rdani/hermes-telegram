@@ -12,18 +12,25 @@ import (
 	"time"
 )
 
+type TurnEntry struct {
+	MsgIDs    []int     `json:"msg_ids"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
 type UserSession struct {
-	UserID           int64     `json:"user_id"`
-	ChatID           int64     `json:"chat_id"`
-	CurrentSessionID string    `json:"current_session_id"`
-	CurrentModel     string    `json:"current_model"`
-	ReasoningEffort      string    `json:"reasoning_effort"`
-	YoloMode             bool      `json:"yolo_mode"`
-	BusyMode             string    `json:"busy_mode"`
-	LastActivity         time.Time `json:"last_activity"`
-	LastPrompt           string    `json:"last_prompt,omitempty"`
-	LastImagePath        string    `json:"last_image_path,omitempty"`
-	RecentTelegramMsgIDs []int     `json:"recent_telegram_msg_ids,omitempty"`
+	UserID               int64       `json:"user_id"`
+	ChatID               int64       `json:"chat_id"`
+	CurrentSessionID     string      `json:"current_session_id"`
+	CurrentModel         string      `json:"current_model"`
+	ReasoningEffort      string      `json:"reasoning_effort"`
+	YoloMode             bool        `json:"yolo_mode"`
+	BusyMode             string      `json:"busy_mode"`
+	LastActivity         time.Time   `json:"last_activity"`
+	LastPrompt           string      `json:"last_prompt,omitempty"`
+	LastImagePath        string      `json:"last_image_path,omitempty"`
+	MaxTelegramTurns     int         `json:"max_telegram_turns,omitempty"`
+	TrackedTurns         []TurnEntry `json:"tracked_turns,omitempty"`
+	RecentTelegramMsgIDs []int       `json:"recent_telegram_msg_ids,omitempty"`
 }
 
 type SessionSummary struct {
@@ -201,41 +208,200 @@ func (m *Manager) UndoLastTurn(sessionID string) error {
 	return cmd.Run()
 }
 
+// StartTurn begins tracking a new user turn with their message ID
+func (m *Manager) StartTurn(userID int64, userMsgID int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s, ok := m.sessions[userID]; ok {
+		var msgIDs []int
+		if userMsgID > 0 {
+			msgIDs = []int{userMsgID}
+			s.RecentTelegramMsgIDs = append(s.RecentTelegramMsgIDs, userMsgID)
+		}
+		s.TrackedTurns = append(s.TrackedTurns, TurnEntry{
+			MsgIDs:    msgIDs,
+			Timestamp: time.Now(),
+		})
+		go m.saveState()
+	}
+}
+
 func (m *Manager) AddTelegramMsgID(userID int64, msgID int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.sessions[userID]; ok {
 		s.RecentTelegramMsgIDs = append(s.RecentTelegramMsgIDs, msgID)
+		if len(s.TrackedTurns) > 0 {
+			lastIdx := len(s.TrackedTurns) - 1
+			s.TrackedTurns[lastIdx].MsgIDs = append(s.TrackedTurns[lastIdx].MsgIDs, msgID)
+		} else {
+			s.TrackedTurns = append(s.TrackedTurns, TurnEntry{
+				MsgIDs:    []int{msgID},
+				Timestamp: time.Now(),
+			})
+		}
 		go m.saveState()
 	}
 }
 
-func (m *Manager) PopOldTelegramMsgIDs(userID int64, maxCount int) []int {
+// RecordTurn records a completed conversational turn (prompt, status, chunks, outbound media).
+// When tracked turns reach MaxTelegramTurns (default: 50 turns), it prunes older turns
+// down to 25 turns (MaxTelegramTurns / 2) and returns all message IDs that must be deleted from Telegram.
+func (m *Manager) RecordTurn(userID int64, msgIDs []int) []int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	s, ok := m.sessions[userID]
-	if !ok || len(s.RecentTelegramMsgIDs) <= maxCount {
+	if !ok {
 		return nil
 	}
-	excess := len(s.RecentTelegramMsgIDs) - maxCount
-	toDelete := make([]int, excess)
-	copy(toDelete, s.RecentTelegramMsgIDs[:excess])
-	s.RecentTelegramMsgIDs = s.RecentTelegramMsgIDs[excess:]
+
+	if len(msgIDs) > 0 {
+		uniqueIDs := make([]int, 0, len(msgIDs))
+		seen := make(map[int]bool)
+		for _, id := range msgIDs {
+			if id > 0 && !seen[id] {
+				seen[id] = true
+				uniqueIDs = append(uniqueIDs, id)
+			}
+		}
+
+		s.TrackedTurns = append(s.TrackedTurns, TurnEntry{
+			MsgIDs:    uniqueIDs,
+			Timestamp: time.Now(),
+		})
+		s.RecentTelegramMsgIDs = append(s.RecentTelegramMsgIDs, uniqueIDs...)
+	}
+
+	maxTurns := s.MaxTelegramTurns
+	if maxTurns < 0 {
+		// Auto-delete disabled
+		go m.saveState()
+		return nil
+	}
+	if maxTurns == 0 {
+		maxTurns = 50 // default: 50 turns
+	}
+
+	targetKeep := maxTurns / 2
+	if targetKeep < 1 {
+		targetKeep = 1
+	}
+
+	if len(s.TrackedTurns) < maxTurns {
+		go m.saveState()
+		return nil
+	}
+
+	excess := len(s.TrackedTurns) - targetKeep
+	if excess <= 0 {
+		go m.saveState()
+		return nil
+	}
+
+	var toDelete []int
+	seenDel := make(map[int]bool)
+	for i := 0; i < excess; i++ {
+		for _, id := range s.TrackedTurns[i].MsgIDs {
+			if !seenDel[id] {
+				seenDel[id] = true
+				toDelete = append(toDelete, id)
+			}
+		}
+	}
+
+	s.TrackedTurns = append([]TurnEntry(nil), s.TrackedTurns[excess:]...)
+
+	var remainingIDs []int
+	for _, t := range s.TrackedTurns {
+		remainingIDs = append(remainingIDs, t.MsgIDs...)
+	}
+	s.RecentTelegramMsgIDs = remainingIDs
+
 	go m.saveState()
 	return toDelete
 }
 
+// PruneTurns checks if turns have reached the limit and prunes them down to 25 turns.
+func (m *Manager) PruneTurns(userID int64) []int {
+	return m.RecordTurn(userID, nil)
+}
+
+// PopOldTelegramMsgIDs satisfies legacy compatibility if called directly
+func (m *Manager) PopOldTelegramMsgIDs(userID int64, maxCount int) []int {
+	return m.RecordTurn(userID, nil)
+}
+
+// ClearTelegramMsgIDs cleans all tracked turns and messages for user
 func (m *Manager) ClearTelegramMsgIDs(userID int64) []int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.sessions[userID]
-	if !ok || len(s.RecentTelegramMsgIDs) == 0 {
+	if !ok {
 		return nil
 	}
-	ids := append([]int(nil), s.RecentTelegramMsgIDs...)
+
+	var ids []int
+	seen := make(map[int]bool)
+	for _, t := range s.TrackedTurns {
+		for _, id := range t.MsgIDs {
+			if !seen[id] {
+				seen[id] = true
+				ids = append(ids, id)
+			}
+		}
+	}
+	for _, id := range s.RecentTelegramMsgIDs {
+		if !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+
+	s.TrackedTurns = nil
 	s.RecentTelegramMsgIDs = nil
 	go m.saveState()
 	return ids
+}
+
+// SetMaxTelegramTurns configures the max turns limit (e.g. 50, 20, 100, or -1 for disabled)
+func (m *Manager) SetMaxTelegramTurns(userID int64, maxTurns int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s, ok := m.sessions[userID]; ok {
+		s.MaxTelegramTurns = maxTurns
+		s.LastActivity = time.Now()
+		go m.saveState()
+	}
+}
+
+// GetAutoDeleteStats returns configuration and current turn counts
+func (m *Manager) GetAutoDeleteStats(userID int64) (maxTurns int, targetKeep int, currentTurns int, currentMsgs int, enabled bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	s, ok := m.sessions[userID]
+	if !ok {
+		return 50, 25, 0, 0, true
+	}
+
+	maxTurns = s.MaxTelegramTurns
+	if maxTurns == 0 {
+		maxTurns = 50
+	}
+	enabled = maxTurns > 0
+	targetKeep = maxTurns / 2
+	if targetKeep < 1 {
+		targetKeep = 1
+	}
+
+	currentTurns = len(s.TrackedTurns)
+	for _, t := range s.TrackedTurns {
+		currentMsgs += len(t.MsgIDs)
+	}
+	if currentMsgs == 0 {
+		currentMsgs = len(s.RecentTelegramMsgIDs)
+	}
+	return
 }
 
 func (m *Manager) loadState() {
@@ -248,6 +414,21 @@ func (m *Manager) loadState() {
 	}
 	var stored map[int64]*UserSession
 	if err := json.Unmarshal(data, &stored); err == nil {
+		for _, s := range stored {
+			// Migrate legacy RecentTelegramMsgIDs into TrackedTurns if TrackedTurns is empty
+			if len(s.TrackedTurns) == 0 && len(s.RecentTelegramMsgIDs) > 0 {
+				for i := 0; i < len(s.RecentTelegramMsgIDs); i += 2 {
+					end := i + 2
+					if end > len(s.RecentTelegramMsgIDs) {
+						end = len(s.RecentTelegramMsgIDs)
+					}
+					s.TrackedTurns = append(s.TrackedTurns, TurnEntry{
+						MsgIDs:    append([]int(nil), s.RecentTelegramMsgIDs[i:end]...),
+						Timestamp: time.Now(),
+					})
+				}
+			}
+		}
 		m.sessions = stored
 		log.Printf("[session] Loaded %d user sessions from %s", len(m.sessions), m.storagePath)
 	}
@@ -261,6 +442,10 @@ func (m *Manager) saveState() {
 		return
 	}
 	_ = os.WriteFile(m.storagePath, data, 0644)
+}
+
+func (m *Manager) SaveSync() {
+	m.saveState()
 }
 
 func (m *Manager) ListHermesSessions(limit int) ([]SessionSummary, error) {

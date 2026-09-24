@@ -7,10 +7,9 @@
   },
   "hermes": {
     "binary_path": "/usr/local/bin/hermes",
-    "default_model": "smart-assistant",
+    "default_model": "Top",
     "working_dir": "/root",
-    "gateway_url": "http://127.0.0.1:8080",
-    "gateway_name": "GoGate",
-    "gateway_key": "sk-gogate-vps-master-key"
+    "gateway_url": "http://127.0.0.1:20128",
+    "gateway_name": "9router"
   }
 }

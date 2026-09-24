@@ -74,10 +74,12 @@ func (h *CommandHandler) HandleHelp(bot *tgbotapi.BotAPI, chatID, userID int64, 
 
 	if query == "" {
 		reply := fmt.Sprintf("📖 *Panduan Perintah Hermes Telegram*\n\n"+
-			"🔹 *Manajemen Sesi:*\n"+
+			"🔹 *Manajemen Sesi & Riwayat:*\n"+
 			"• `/new` - Mulai sesi baru (fresh session ID + history)\n"+
 			"• `/sessions` - Telusuri & resume sesi-sesi sebelumnya\n"+
 			"• `/resume <id>` - Lanjutkan sesi tertentu berdasarkan ID\n"+
+			"• `/autodelete [limit]` - Auto-delete pesan Telegram (default: 50 turns -> sisa 25)\n"+
+			"• `/clean` - Bersihkan pesan riwayat dari chat Telegram sekarang\n"+
 			"• `/title <nama>` - Beri judul untuk sesi aktif saat ini\n"+
 			"• `/clear` - Hapus histori sesi aktif\n\n"+
 			"🔹 *Konfigurasi & Model:*\n"+
@@ -172,11 +174,11 @@ func (h *CommandHandler) HandleStatus(bot *tgbotapi.BotAPI, chatID, userID int64
 	// 2. Gateway ping
 	gwName := h.cfg.Hermes.GatewayName
 	if gwName == "" {
-		gwName = "GoGate"
+		gwName = "9router"
 	}
 	gwURL := h.cfg.Hermes.GatewayURL
 	if gwURL == "" {
-		gwURL = "http://127.0.0.1:8080"
+		gwURL = "http://127.0.0.1:20128"
 	}
 	gwStatus := fmt.Sprintf("🟢 Online (%s)", gwURL)
 	client := http.Client{
@@ -1181,11 +1183,11 @@ func (h *CommandHandler) HandleBundles(bot *tgbotapi.BotAPI, chatID int64) {
 func (h *CommandHandler) HandlePlatform(bot *tgbotapi.BotAPI, chatID int64) {
 	gwName := h.cfg.Hermes.GatewayName
 	if gwName == "" {
-		gwName = "GoGate"
+		gwName = "9router"
 	}
 	gwURL := h.cfg.Hermes.GatewayURL
 	if gwURL == "" {
-		gwURL = "http://127.0.0.1:8080"
+		gwURL = "http://127.0.0.1:20128"
 	}
 	reply := fmt.Sprintf("🌐 *Status Platform & Daemon:*\n\n"+
 		"• *Hermes Telegram Gateway:* 🟢 Active (Go Native Systemd)\n"+
@@ -1356,6 +1358,71 @@ func (h *CommandHandler) HandleHeartbeat(bot *tgbotapi.BotAPI, chatID int64, arg
 func (h *CommandHandler) HandleLoop(bot *tgbotapi.BotAPI, chatID int64, arg string) {
 	reply := "🔁 *Loop Eksekusi Proaktif*\n\n" +
 		"• *Status:* Tidak ada loop tugas yang aktif saat ini."
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleAutoDelete(bot *tgbotapi.BotAPI, chatID, userID int64, arg string) {
+	arg = strings.TrimSpace(strings.ToLower(arg))
+
+	if arg == "off" || arg == "disable" || arg == "disabled" || arg == "0" {
+		h.sessMgr.SetMaxTelegramTurns(userID, -1)
+		reply := "🚫 *Auto-Delete Percakapan Telegram Dinonaktifkan*\n\n" +
+			"Pesan riwayat di aplikasi Telegram tidak akan dihapus otomatis."
+		dismissKb := DismissKeyboard()
+		_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+		return
+	}
+
+	if arg != "" && arg != "status" && arg != "info" {
+		limit, err := strconv.Atoi(arg)
+		if err != nil || limit < 2 || limit > 1000 {
+			reply := "⚠️ *Format Tidak Valid*\n\n" +
+				"Gunakan format angka turns antara 2 hingga 1000.\n" +
+				"Contoh:\n" +
+				"• `/autodelete 50` (Pemicu 50 turns, pangkas ke 25 turns)\n" +
+				"• `/autodelete 20` (Pemicu 20 turns, pangkas ke 10 turns)\n" +
+				"• `/autodelete off` (Nonaktifkan)\n" +
+				"• `/autodelete clean` (Bersihkan sekarang)"
+			dismissKb := DismissKeyboard()
+			_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+			return
+		}
+
+		h.sessMgr.SetMaxTelegramTurns(userID, limit)
+		targetKeep := limit / 2
+		reply := fmt.Sprintf("✅ *Batas Auto-Delete Diperbarui!*\n\n"+
+			"• *Batas Pemicu:* `%d turns`\n"+
+			"• *Target Pembersihan:* `%d turns`\n\n"+
+			"_Saat chat mencapai %d turns (lintas sesi), sistem otomatis membersihkan obrolan hingga tersisa %d turns terbaru._",
+			limit, targetKeep, limit, targetKeep)
+		dismissKb := DismissKeyboard()
+		_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+		return
+	}
+
+	// Show current status
+	maxTurns, targetKeep, curTurns, curMsgs, enabled := h.sessMgr.GetAutoDeleteStats(userID)
+	statusStr := "🟢 Aktif"
+	if !enabled {
+		statusStr = "🔴 Nonaktif"
+	}
+
+	reply := fmt.Sprintf("🧹 *Pengaturan Auto-Delete Riwayat Telegram*\n\n"+
+		"• *Status:* %s\n"+
+		"• *Batas Pemicu (Max Turns):* `%d turns`\n"+
+		"• *Sisa Setelah Clean:* `%d turns`\n"+
+		"• *Turn Terlacak Saat Ini:* `%d turns` (~`%d pesan`)\n\n"+
+		"_Saat total pesan mencapai %d turns (lintas sesi), sistem otomatis membersihkan obrolan lama di Telegram hingga tersisa %d turns saja._\n"+
+		"_Catatan: Seluruh riwayat sesi dan memori Aida di server tetap aman 100%%._\n\n"+
+		"💡 *Perintah Pengaturan:*\n"+
+		"• `/autodelete 50` - Set batas 50 turns (default, pangkas ke 25)\n"+
+		"• `/autodelete 20` - Set batas 20 turns (pangkas ke 10)\n"+
+		"• `/autodelete 100` - Set batas 100 turns (pangkas ke 50)\n"+
+		"• `/autodelete clean` - Bersihkan riwayat Telegram sekarang\n"+
+		"• `/autodelete off` - Nonaktifkan auto-delete",
+		statusStr, maxTurns, targetKeep, curTurns, curMsgs, maxTurns, targetKeep)
+
 	dismissKb := DismissKeyboard()
 	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
 }

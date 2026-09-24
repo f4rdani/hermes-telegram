@@ -55,7 +55,7 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.Hermes.BinaryPath = "/usr/local/bin/hermes"
 	}
 	if cfg.Hermes.DefaultModel == "" {
-		cfg.Hermes.DefaultModel = "smart-assistant"
+		cfg.Hermes.DefaultModel = "Top"
 	}
 	if cfg.Hermes.WorkingDir == "" {
 		cfg.Hermes.WorkingDir = home
@@ -73,18 +73,16 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.Hermes.SessionsPath = filepath.Join(configDir, "sessions.json")
 	}
 	if cfg.Hermes.GatewayURL == "" {
-		cfg.Hermes.GatewayURL = "http://127.0.0.1:8080"
+		cfg.Hermes.GatewayURL = "http://127.0.0.1:20128"
 	}
 	if cfg.Hermes.GatewayName == "" {
-		cfg.Hermes.GatewayName = "GoGate"
+		cfg.Hermes.GatewayName = "9router"
 	}
 	if cfg.Hermes.GatewayKey == "" {
-		if envKey := os.Getenv("GOGATE_API_KEY"); envKey != "" {
+		if envKey := os.Getenv("ROUTER_API_KEY"); envKey != "" {
 			cfg.Hermes.GatewayKey = envKey
-		} else if envKey := os.Getenv("GOGATE_KEY"); envKey != "" {
+		} else if envKey := os.Getenv("OPENAI_API_KEY"); envKey != "" {
 			cfg.Hermes.GatewayKey = envKey
-		} else {
-			cfg.Hermes.GatewayKey = "sk-gogate-vps-master-key"
 		}
 	}
 

@@ -74,12 +74,16 @@ func NewBotServer(cfg *config.Config, version string) (*BotServer, error) {
 }
 
 func (s *BotServer) registerCommands() {
-	setCmds := tgbotapi.NewSetMyCommands(HermesMenuCommands...)
+	cmds := HermesMenuCommands
+	if len(cmds) > 99 {
+		cmds = cmds[:99]
+	}
+	setCmds := tgbotapi.NewSetMyCommands(cmds...)
 	_, err := s.bot.Request(setCmds)
 	if err != nil {
 		log.Printf("[bot] Warning: Failed to register Telegram menu commands: %v", err)
 	} else {
-		log.Printf("[bot] Successfully registered %d Hermes menu commands with Telegram API", len(HermesMenuCommands))
+		log.Printf("[bot] Successfully registered %d Hermes menu commands with Telegram API", len(cmds))
 	}
 }
 
@@ -228,8 +232,8 @@ func (s *BotServer) handleMessage(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Track incoming user message ID for 50-turn Telegram window
-	s.sessMgr.AddTelegramMsgID(userID, msg.MessageID)
+	// Track incoming user message ID as the start of a turn for 50-turn Telegram window
+	s.sessMgr.StartTurn(userID, msg.MessageID)
 
 	// 1. Check for Media message (photo, voice, audio, document)
 	hasMedia := len(msg.Photo) > 0 || msg.Voice != nil || msg.Audio != nil || msg.Document != nil
@@ -316,6 +320,12 @@ func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
 		s.handleQueueCommand(chatID, userID, arg)
 	case "/clean", "/prune":
 		s.handleCleanCommand(chatID, userID)
+	case "/autodelete":
+		if arg == "clean" || arg == "clear" {
+			s.handleCleanCommand(chatID, userID)
+		} else {
+			s.cmdHandler.HandleAutoDelete(s.bot, chatID, userID, arg)
+		}
 	case "/diff":
 		s.cmdHandler.HandleDiff(s.bot, chatID)
 	case "/skills":
@@ -768,7 +778,11 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 		if result != nil && result.SessionID != "" {
 			activeSessionID = result.SessionID
 		}
-		footer := s.formatResultFooter(duration, result, activeSessionID)
+		activeModel := userSess.CurrentModel
+		if activeModel == "" && s.cfg != nil {
+			activeModel = s.cfg.Hermes.DefaultModel
+		}
+		footer := s.formatResultFooter(duration, result, activeSessionID, activeModel)
 		sb.WriteString(footer)
 
 		errMsg := sb.String()
@@ -811,8 +825,12 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 	if result != nil && result.SessionID != "" {
 		activeSessionID = result.SessionID
 	}
+	activeModel := userSess.CurrentModel
+	if activeModel == "" && s.cfg != nil {
+		activeModel = s.cfg.Hermes.DefaultModel
+	}
 
-	footer := s.formatResultFooter(duration, result, activeSessionID)
+	footer := s.formatResultFooter(duration, result, activeSessionID, activeModel)
 	fullResponse := finalText + footer
 
 	// Deliver response chunks (Telegram 12.9 Rich Message limit 32768, safe margin 30000)
@@ -848,8 +866,8 @@ func (s *BotServer) checkAndRunNextQueuedTask(userID int64) {
 }
 
 func (s *BotServer) pruneOldTelegramMessages(chatID, userID int64) {
-	// 50 turns = 50 user prompts + 50 bot replies = 100 messages total in Telegram
-	toDelete := s.sessMgr.PopOldTelegramMsgIDs(userID, 100)
+	// Auto-prune turns when threshold (default: 50 turns) is reached, pruning down to 25 turns
+	toDelete := s.sessMgr.PruneTurns(userID)
 	if len(toDelete) == 0 {
 		return
 	}
@@ -860,7 +878,7 @@ func (s *BotServer) pruneOldTelegramMessages(chatID, userID int64) {
 			_, _ = s.bot.Send(del)
 			time.Sleep(30 * time.Millisecond)
 		}
-		log.Printf("[bot] Pruned %d old Telegram messages in chat %d to maintain 50 turns window", len(ids), chat)
+		log.Printf("[bot] Auto-pruned %d old Telegram messages in chat %d (maintained 25 turns window)", len(ids), chat)
 	}(chatID, toDelete)
 }
 
@@ -872,7 +890,7 @@ func truncate(s string, max int) string {
 	return s
 }
 
-func (s *BotServer) formatResultFooter(duration time.Duration, result *engine.RunResult, sessionID string) string {
+func (s *BotServer) formatResultFooter(duration time.Duration, result *engine.RunResult, sessionID string, model string) string {
 	var parts []string
 
 	// 1. Duration
@@ -892,6 +910,9 @@ func (s *BotServer) formatResultFooter(duration time.Duration, result *engine.Ru
 			totalTokens = details.InputTokens + details.OutputTokens
 			if details.MessageCount > 0 {
 				turns = (details.MessageCount + 1) / 2
+			}
+			if model == "" && details.Model != "" {
+				model = details.Model
 			}
 		}
 	}
@@ -918,7 +939,15 @@ func (s *BotServer) formatResultFooter(duration time.Duration, result *engine.Ru
 		parts = append(parts, fmt.Sprintf("🆔 %s", shortID))
 	}
 
-	// 4. Version
+	// 4. Model (inserted before version)
+	if model == "" && s.cfg != nil {
+		model = s.cfg.Hermes.DefaultModel
+	}
+	if model != "" {
+		parts = append(parts, fmt.Sprintf("🤖 %s", model))
+	}
+
+	// 5. Version
 	ver := s.version
 	if !strings.HasPrefix(ver, "v") {
 		ver = "v" + ver

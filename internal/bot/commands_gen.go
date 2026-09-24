@@ -50,6 +50,8 @@ var HermesMenuCommands = []tgbotapi.BotCommand{
 	{Command: "sethome", Description: "Set this chat as the home channel"},
 	{Command: "codex_runtime", Description: "Toggle codex app-server runtime for OpenAI/Codex models"},
 	{Command: "personality", Description: "Set a predefined personality"},
+	{Command: "autodelete", Description: "Konfigurasi auto-delete riwayat pesan Telegram (default: 50 turns -> sisa 25)"},
+	{Command: "clean", Description: "Bersihkan seluruh pesan riwayat lama dari obrolan Telegram sekarang"},
 	{Command: "diff", Description: "Show git changes in the working directory"},
 	{Command: "footer", Description: "Toggle gateway runtime-metadata footer on final replies"},
 	{Command: "yolo", Description: "Toggle YOLO mode (skip all dangerous command approvals)"},

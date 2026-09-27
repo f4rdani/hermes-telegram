@@ -12,68 +12,114 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
+var (
+	ErrInactivityTimeout = errors.New("inactivity timeout: tidak ada aktivitas/output selama batas waktu")
+	ErrHardTimeout       = errors.New("batas waktu maksimal (hard ceiling) terlampaui")
+	ErrUserCanceled      = errors.New("operasi dibatalkan oleh pengguna")
+)
+
 type RunOptions struct {
-	Prompt          string
-	ImagePath       string
-	SessionID       string
-	Model           string
-	ReasoningEffort string
-	Yolo            bool
-	PreloadSkills   string
-	WorkingDir      string
-	Timeout         time.Duration
-	OnProgress      func(displayText string)
+	Prompt            string
+	ImagePath         string
+	SessionID         string
+	Model             string
+	ReasoningEffort   string
+	Yolo              bool
+	PreloadSkills     string
+	WorkingDir        string
+	Timeout           time.Duration // Hard safety ceiling (default: 2 hours)
+	InactivityTimeout time.Duration // Inactivity/AFK timeout (default: 5 minutes)
+	OnProgress        func(displayText string)
 }
 
 type Runner struct {
 	binaryPath string
 	mu         sync.Mutex
-	running    map[int64]context.CancelFunc
+	running    map[string]context.CancelFunc
 }
 
 func NewRunner(binaryPath string) *Runner {
 	return &Runner{
 		binaryPath: binaryPath,
-		running:    make(map[int64]context.CancelFunc),
+		running:    make(map[string]context.CancelFunc),
 	}
 }
 
+// mainKey is the run slot for the user's foreground task.
+func mainKey(userID int64) string {
+	return ForegroundKey(userID)
+}
+
+// ForegroundKey is the exported form for the bot layer (approval cards track the exact slot).
+func ForegroundKey(userID int64) string {
+	return fmt.Sprintf("user:%d", userID)
+}
+
 func (r *Runner) IsRunning(userID int64) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	_, exists := r.running[userID]
-	return exists
+	return r.IsRunningKey(mainKey(userID))
 }
 
 func (r *Runner) Stop(userID int64) bool {
+	return r.StopKey(mainKey(userID))
+}
+
+// IsRunningKey reports whether a specific run slot (foreground or background) is active.
+func (r *Runner) IsRunningKey(key string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	cancel, exists := r.running[userID]
+	_, exists := r.running[key]
+	return exists
+}
+
+// StopKey cancels a specific run slot.
+func (r *Runner) StopKey(key string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cancel, exists := r.running[key]
 	if exists {
 		cancel()
-		delete(r.running, userID)
+		delete(r.running, key)
 		return true
 	}
 	return false
 }
 
 func (r *Runner) Execute(ctx context.Context, userID int64, opts RunOptions) (*RunResult, error) {
+	return r.ExecuteWithKey(ctx, mainKey(userID), userID, opts)
+}
+
+// ExecuteWithKey runs Hermes in a named slot so background tasks can run
+// alongside the user's foreground task without colliding on the busy guard.
+func (r *Runner) ExecuteWithKey(ctx context.Context, key string, userID int64, opts RunOptions) (*RunResult, error) {
+	inactTimeout := opts.InactivityTimeout
+	if inactTimeout <= 0 {
+		inactTimeout = 5 * time.Minute
+	}
+	hardTimeout := opts.Timeout
+	if hardTimeout <= 0 {
+		hardTimeout = 2 * time.Hour
+	}
+
+	hardCtx, hardCancel := context.WithTimeout(ctx, hardTimeout)
+	defer hardCancel()
+
+	runCtx, cancel := context.WithCancel(hardCtx)
+
 	r.mu.Lock()
-	if _, busy := r.running[userID]; busy {
+	if _, busy := r.running[key]; busy {
 		r.mu.Unlock()
 		return nil, fmt.Errorf("ada tugas yang masih berjalan untuk pengguna ini")
 	}
-
-	runCtx, cancel := context.WithCancel(ctx)
-	r.running[userID] = cancel
+	r.running[key] = cancel
 	r.mu.Unlock()
 
 	defer func() {
 		r.mu.Lock()
-		delete(r.running, userID)
+		delete(r.running, key)
 		r.mu.Unlock()
 		cancel()
 	}()
@@ -120,8 +166,8 @@ func (r *Runner) Execute(ctx context.Context, userID int64, opts RunOptions) (*R
 	if opts.WorkingDir != "" {
 		args = append(args, "--in", opts.WorkingDir)
 	}
-	if opts.Timeout > 0 {
-		budgetSec := int(opts.Timeout.Seconds()) - 60
+	if hardTimeout > 0 {
+		budgetSec := int(hardTimeout.Seconds()) - 60
 		if budgetSec > 30 {
 			args = append(args, "--run-budget", strconv.Itoa(budgetSec))
 		}
@@ -136,6 +182,15 @@ func (r *Runner) Execute(ctx context.Context, userID int64, opts RunOptions) (*R
 
 	// Crucial: Set PYTHONUNBUFFERED=1 to stream tokens immediately without buffering!
 	cmd.Env = append(os.Environ(), "PYTHONUNBUFFERED=1")
+
+	// Set process group so cancelling terminates all child processes (bash, ffmpeg, scripts)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process != nil && cmd.Process.Pid > 0 {
+			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return nil
+	}
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -162,6 +217,56 @@ func (r *Runner) Execute(ctx context.Context, userID int64, opts RunOptions) (*R
 		resultObj       *RunResult
 		isAnswering     bool
 	)
+
+	var (
+		activityMu   sync.Mutex
+		lastActivity = time.Now()
+		isStuck      bool
+		stopWatchdog = make(chan struct{})
+		stopOnce     sync.Once
+	)
+
+	stopWatchdogFunc := func() {
+		stopOnce.Do(func() {
+			close(stopWatchdog)
+		})
+	}
+	defer stopWatchdogFunc()
+
+	// Inactivity watchdog: monitor if stdoutPipe produces no output for inactTimeout
+	checkInterval := inactTimeout / 5
+	if checkInterval > 1*time.Second {
+		checkInterval = 1 * time.Second
+	} else if checkInterval < 100*time.Millisecond {
+		checkInterval = 100 * time.Millisecond
+	}
+
+	go func() {
+		ticker := time.NewTicker(checkInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopWatchdog:
+				return
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				activityMu.Lock()
+				silentFor := time.Since(lastActivity)
+				activityMu.Unlock()
+
+				if silentFor >= inactTimeout {
+					activityMu.Lock()
+					isStuck = true
+					activityMu.Unlock()
+					log.Printf("[engine] Inactivity timeout: slot '%s' silent for %v (limit: %v). Terminating stuck process.",
+						key, silentFor.Round(time.Second), inactTimeout)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
 
 	triggerProgress := func(force bool) {
 		if opts.OnProgress == nil {
@@ -192,6 +297,9 @@ func (r *Runner) Execute(ctx context.Context, userID int64, opts RunOptions) (*R
 		// Display currently running tool or phase
 		if currentToolFull != "" {
 			sb.WriteString(fmt.Sprintf("⚡ *Sedang dijalankan:* %s\n⏳ _Menunggu proses selesai..._\n\n", currentToolFull))
+			if isSelfRestartRiskTool(currentToolFull) {
+				sb.WriteString("⚠️ _Peringatan: self-restart terdeteksi — harap hati-hati, bot bisa mati sebelum membalas. Disarankan /restart._\n\n")
+			}
 		} else if isAnswering {
 			sb.WriteString("⚡ *Status:* ✍️ _Menyusun dan merapikan jawaban untuk kamu..._\n\n")
 		} else if len(toolHistory) == 0 {
@@ -206,6 +314,10 @@ func (r *Runner) Execute(ctx context.Context, userID int64, opts RunOptions) (*R
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
+
+		activityMu.Lock()
+		lastActivity = time.Now()
+		activityMu.Unlock()
 
 		event, err := ParseEvent(line)
 		if err != nil {
@@ -273,21 +385,39 @@ func (r *Runner) Execute(ctx context.Context, userID int64, opts RunOptions) (*R
 		}
 	}
 
+	stopWatchdogFunc()
+
 	cmdErr := cmd.Wait()
 
-	if errors.Is(runCtx.Err(), context.Canceled) {
-		return nil, fmt.Errorf("operasi dibatalkan oleh pengguna")
-	}
+	activityMu.Lock()
+	stuck := isStuck
+	activityMu.Unlock()
 
-	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+	if stuck {
 		partialText := strings.TrimSpace(accumulatedText.String())
 		return &RunResult{
 			SessionID:   sessionID,
 			FinalText:   partialText,
 			ExitCode:    124,
-			Error:       "timeout: batas waktu eksekusi terlampaui",
+			Error:       fmt.Sprintf("stuck: tidak ada respons/aktivitas selama %v", inactTimeout),
 			ToolHistory: toolHistory,
-		}, fmt.Errorf("batas waktu eksekusi tercapai (timeout %v)", opts.Timeout)
+			IsStuck:     true,
+		}, ErrInactivityTimeout
+	}
+
+	if errors.Is(runCtx.Err(), context.Canceled) {
+		return nil, ErrUserCanceled
+	}
+
+	if errors.Is(hardCtx.Err(), context.DeadlineExceeded) {
+		partialText := strings.TrimSpace(accumulatedText.String())
+		return &RunResult{
+			SessionID:   sessionID,
+			FinalText:   partialText,
+			ExitCode:    124,
+			Error:       fmt.Sprintf("hard timeout: batas waktu maksimal %v terlampaui", hardTimeout),
+			ToolHistory: toolHistory,
+		}, ErrHardTimeout
 	}
 
 	if resultObj == nil {
@@ -419,5 +549,22 @@ func truncate(s string, max int) string {
 		return s[:max] + "..."
 	}
 	return s
+}
+
+// isSelfRestartRiskTool mirrors the gateway-side warning in bot.go.
+// Warning only — execution is never blocked per user request.
+func isSelfRestartRiskTool(currentToolFull string) bool {
+	lower := strings.ToLower(currentToolFull)
+	hasSystemctl := strings.Contains(lower, "systemctl")
+	hasHermesTele := strings.Contains(lower, "hermes-tele")
+	hasGoBuild := strings.Contains(lower, "go build")
+	hasAppsHermes := strings.Contains(lower, "apps/hermes-tele")
+	if hasSystemctl && hasHermesTele {
+		return true
+	}
+	if hasGoBuild && (hasHermesTele || hasAppsHermes) {
+		return true
+	}
+	return false
 }
 

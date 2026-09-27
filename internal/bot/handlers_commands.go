@@ -20,12 +20,24 @@ import (
 )
 
 type CommandHandler struct {
-	cfg           *config.Config
-	sessMgr       *session.Manager
-	runner        *engine.Runner
-	modelResolver *ModelResolver
-	version       string
-	startTime     time.Time
+	cfg            *config.Config
+	sessMgr        *session.Manager
+	runner         *engine.Runner
+	modelResolver  *ModelResolver
+	version        string
+	startTime      time.Time
+	configPath     string
+	bgLinesProvider func() []string
+}
+
+// SetConfigPath records the config file path (for /model --global persistence).
+func (h *CommandHandler) SetConfigPath(path string) {
+	h.configPath = path
+}
+
+// SetBgLinesProvider wires the /bg registry renderer (set by BotServer to avoid import cycles).
+func (h *CommandHandler) SetBgLinesProvider(fn func() []string) {
+	h.bgLinesProvider = fn
 }
 
 func NewCommandHandler(cfg *config.Config, sessMgr *session.Manager, runner *engine.Runner, modelResolver *ModelResolver, version string) *CommandHandler {
@@ -300,6 +312,25 @@ func (h *CommandHandler) HandleModel(bot *tgbotapi.BotAPI, chatID, userID int64,
 	s := h.sessMgr.Get(userID, chatID)
 	modelArg = strings.TrimSpace(modelArg)
 
+	// /model --global [<name>]: show or persist the default model for new sessions.
+	if strings.HasPrefix(modelArg, "--global") {
+		rest := strings.TrimSpace(strings.TrimPrefix(modelArg, "--global"))
+		rest = strings.TrimPrefix(rest, "=")
+		rest = strings.TrimSpace(rest)
+		if rest == "" {
+			_, _ = SendSafeMessage(bot, chatID, fmt.Sprintf("🌍 *Model Default Global:* `%s`\n\n_Model untuk sesi baru & user baru. Sesi aktif kamu: `%s`._\n\nGunakan `/model --global <nama_model>` untuk mengubah.", h.cfg.Hermes.DefaultModel, s.CurrentModel), nil)
+			return
+		}
+		if err := h.persistDefaultModel(rest); err != nil {
+			_, _ = SendSafeMessage(bot, chatID, fmt.Sprintf("❌ Gagal menyimpan model global: %v", err), nil)
+			return
+		}
+		h.cfg.Hermes.DefaultModel = rest
+		h.sessMgr.SetModel(userID, rest)
+		_, _ = SendSafeMessage(bot, chatID, fmt.Sprintf("🌍✅ *Model Default Global diubah menjadi:* `%s`\n_Model sesi aktifmu ikut diganti. Berlaku untuk sesi/user baru; user lain yang sudah ada tetap memakai pilihannya sampai mereka ganti sendiri._", rest), nil)
+		return
+	}
+
 	if modelArg == "" {
 		reply := fmt.Sprintf("🤖 *Pengaturan Model AI*\n\nModel aktif saat ini: `%s`\n\nPilih salah satu model di bawah atau ketik `/model <nama_model>`:", s.CurrentModel)
 		var models []ModelInfo
@@ -313,6 +344,38 @@ func (h *CommandHandler) HandleModel(bot *tgbotapi.BotAPI, chatID, userID int64,
 
 	h.sessMgr.SetModel(userID, modelArg)
 	_, _ = SendSafeMessage(bot, chatID, fmt.Sprintf("✅ Model AI untuk sesi ini berhasil diubah menjadi: `%s`", modelArg), nil)
+}
+
+// persistDefaultModel writes hermes.default_model into config.json via a raw-map
+// round-trip so unknown fields and formatting of other keys are preserved.
+func (h *CommandHandler) persistDefaultModel(model string) error {
+	if h.configPath == "" {
+		return fmt.Errorf("path config tidak diketahui")
+	}
+	data, err := os.ReadFile(h.configPath)
+	if err != nil {
+		return err
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	hermes, _ := raw["hermes"].(map[string]interface{})
+	if hermes == nil {
+		hermes = make(map[string]interface{})
+		raw["hermes"] = hermes
+	}
+	hermes["default_model"] = model
+	out, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	if err := os.WriteFile(h.configPath, out, 0644); err != nil {
+		return err
+	}
+	log.Printf("[bot] Default model persisted to %s: %s", h.configPath, model)
+	return nil
 }
 
 func (h *CommandHandler) HandleReasoning(bot *tgbotapi.BotAPI, chatID, userID int64, arg string) {
@@ -885,12 +948,13 @@ func (h *CommandHandler) HandleSendFile(bot *tgbotapi.BotAPI, chatID, userID int
 	switch {
 	case isVideoFile(filePath):
 		vid := tgbotapi.NewVideo(chatID, tgbotapi.FilePath(filePath))
+		vid.SupportsStreaming = true
 		vid.Caption = fmt.Sprintf("🎬 %s", fileName)
 		sent, err := bot.Send(vid)
 		if err != nil {
 			log.Printf("[bot] Failed to send video (%s), falling back to document: %v", filePath, err)
 			doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(filePath))
-			doc.Caption = fmt.Sprintf("📎 %s", fileName)
+			doc.Caption = fmt.Sprintf("📎 %s (video gagal diputar langsung, dikirim sebagai file)", fileName)
 			sentDoc, errDoc := bot.Send(doc)
 			if errDoc != nil {
 				reply := fmt.Sprintf("❌ Gagal mengirim file: %v", errDoc)
@@ -1149,6 +1213,19 @@ func (h *CommandHandler) HandleAgents(bot *tgbotapi.BotAPI, chatID, userID int64
 	if out, err := exec.Command("pgrep", "-c", "ffmpeg").Output(); err == nil && strings.TrimSpace(string(out)) != "0" {
 		bgStatus = "🎬 *ffmpeg sedang merender video di latar belakang!*"
 	}
+	if h.bgLinesProvider != nil {
+		if lines := h.bgLinesProvider(); len(lines) > 0 {
+			running := 0
+			for _, l := range lines {
+				if strings.Contains(l, "[running]") {
+					running++
+				}
+			}
+			if running > 0 {
+				bgStatus = fmt.Sprintf("🛰️ *%d background task Telegram aktif* (detail: `/ps`)", running)
+			}
+		}
+	}
 
 	reply := fmt.Sprintf(
 		"🤖 *Status Agen & Tugas Berjalan*\n\n"+
@@ -1183,6 +1260,18 @@ func (h *CommandHandler) HandleProcessStatus(bot *tgbotapi.BotAPI, chatID int64)
 				hasHermesBg = true
 			}
 			sb.WriteString("\n")
+		}
+	}
+
+	// 1b. Go gateway background tasks (/bg registry)
+	hasGoBg := false
+	if h.bgLinesProvider != nil {
+		if lines := h.bgLinesProvider(); len(lines) > 0 {
+			sb.WriteString("🛰️ *Telegram Background Tasks (/bg):*\n")
+			for _, l := range lines {
+				sb.WriteString(l + "\n\n")
+			}
+			hasGoBg = true
 		}
 	}
 
@@ -1245,7 +1334,7 @@ func (h *CommandHandler) HandleProcessStatus(bot *tgbotapi.BotAPI, chatID int64)
 		}
 	}
 
-	if !hasHermesBg && !hasSystemTask {
+	if !hasHermesBg && !hasGoBg && !hasSystemTask {
 		sb.WriteString("✅ *Tidak ada proses render atau task berat di latar belakang.*\n")
 		sb.WriteString("_Sistem dalam keadaan idle dan siap menerima instruksi baru._\n\n")
 	}
@@ -1267,23 +1356,52 @@ func (h *CommandHandler) HandleProcessStatus(bot *tgbotapi.BotAPI, chatID int64)
 }
 
 func (h *CommandHandler) HandleMemory(bot *tgbotapi.BotAPI, chatID int64, arg string) {
-	memPath := filepath.Join(h.cfg.Hermes.HermesHome, "memories", "MEMORY.md")
+	memDir := filepath.Join(h.cfg.Hermes.HermesHome, "memories")
+	memPath := filepath.Join(memDir, "MEMORY.md")
 	data, err := os.ReadFile(memPath)
 	memText := strings.TrimSpace(string(data))
 
-	if err != nil || memText == "" {
-		reply := "🧠 *Memori Jangka Panjang Hermes Agent*\n\n_Belum ada catatan preferensi tersimpan di MEMORY.md._\n\n_Anda dapat meminta Hermes mengingat sesuatu dalam obrolan atau menggunakan `/refine`._"
-		dismissKb := DismissKeyboard()
-		_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
-		return
+	var sb strings.Builder
+	sb.WriteString("🧠 *Memori Jangka Panjang Hermes Agent*\n\n")
+
+	// 1. Directory inventory with sizes.
+	if entries, dirErr := os.ReadDir(memDir); dirErr == nil {
+		sb.WriteString(fmt.Sprintf("📁 *%s* (%d berkas):\n", memDir, len(entries)))
+		shown := 0
+		for _, e := range entries {
+			if shown >= 15 {
+				sb.WriteString(fmt.Sprintf("• _...dan %d berkas lain_\n", len(entries)-shown))
+				break
+			}
+			size := ""
+			if info, sErr := e.Info(); sErr == nil {
+				if info.IsDir() {
+					size = "dir"
+				} else if info.Size() > 1024*1024 {
+					size = fmt.Sprintf("%.1f MB", float64(info.Size())/1048576.0)
+				} else {
+					size = fmt.Sprintf("%.0f KB", float64(info.Size())/1024.0)
+				}
+			}
+			sb.WriteString(fmt.Sprintf("• `%s` (%s)\n", e.Name(), size))
+			shown++
+		}
+		sb.WriteString("\n")
+	} else {
+		sb.WriteString("_Direktori memori tidak ditemukan._\n\n")
 	}
 
-	if len(memText) > 2000 {
-		memText = memText[:2000] + "\n...(dipotong)"
+	// 2. MEMORY.md excerpt.
+	if err != nil || memText == "" {
+		sb.WriteString("_Belum ada catatan preferensi tersimpan di MEMORY.md._\n\n_Anda dapat meminta Hermes mengingat sesuatu dalam obrolan atau menggunakan `/refine`._")
+	} else {
+		if len(memText) > 2000 {
+			memText = memText[:2000] + "\n...(dipotong)"
+		}
+		sb.WriteString(fmt.Sprintf("*Isi `MEMORY.md`:*\n```markdown\n%s\n```", memText))
 	}
-	reply := fmt.Sprintf("🧠 *Isi Memori Hermes Agent (`MEMORY.md`):*\n\n```markdown\n%s\n```", memText)
 	dismissKb := DismissKeyboard()
-	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+	_, _ = SendSafeMessage(bot, chatID, sb.String(), dismissKb)
 }
 
 func (h *CommandHandler) HandleBundles(bot *tgbotapi.BotAPI, chatID int64) {
@@ -1318,12 +1436,59 @@ func (h *CommandHandler) HandlePlatform(bot *tgbotapi.BotAPI, chatID int64) {
 	if gwURL == "" {
 		gwURL = "http://127.0.0.1:20128"
 	}
-	reply := fmt.Sprintf("🌐 *Status Platform & Daemon:*\n\n"+
-		"• *Hermes Telegram Gateway:* 🟢 Active (Go Native Systemd)\n"+
-		"• *%s AI Gateway:* 🟢 Active (%s)\n"+
-		"• *Camofox Browser:* 🟢 Active (:9377)\n"+
+
+	dot := func(ok bool) string {
+		if ok {
+			return "🟢"
+		}
+		return "🔴"
+	}
+
+	// Functional probe: 9router-compatible GET /v1/models (short timeout).
+	gwOK, gwLatency := false, ""
+	func() {
+		client := http.Client{Timeout: 3 * time.Second}
+		start := time.Now()
+		resp, err := client.Get(strings.TrimRight(gwURL, "/") + "/v1/models")
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 500 {
+			gwOK = true
+			gwLatency = time.Since(start).Round(time.Millisecond).String()
+		}
+	}()
+
+	// Service-level status via systemd (fast, no network assumptions).
+	sysActive := func(unit string) bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, "systemctl", "is-active", unit).Output()
+		return err == nil && strings.TrimSpace(string(out)) == "active"
+	}
+
+	gwLine := fmt.Sprintf("%s *%s AI Gateway:* %s", dot(gwOK), gwName, gwURL)
+	if gwOK {
+		gwLine += fmt.Sprintf(" (OK, %s)", gwLatency)
+	} else {
+		gwLine += " (tidak merespons /v1/models)"
+	}
+
+	camofox := sysActive("camofox.service")
+	warp := sysActive("warp-proxy.service")
+	hermesTele := sysActive("hermes-tele.service")
+
+	reply := fmt.Sprintf("🌐 *Status Platform & Daemon (live check):*\n\n"+
+		"• *Hermes Telegram Gateway:* %s Active (Go Native Systemd, `%s`)\n"+
+		"• %s\n"+
+		"• *Camofox Browser:* %s %s\n"+
+		"• *WARP Proxy:* %s %s\n"+
 		"• *Platform Mode:* Direct Telegram Bot API Polling",
-		gwName, gwURL)
+		dot(hermesTele), h.version,
+		gwLine,
+		dot(camofox), "(camofox.service)",
+		dot(warp), "(warp-proxy.service)")
 	dismissKb := DismissKeyboard()
 	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
 }
@@ -1361,7 +1526,10 @@ func (h *CommandHandler) HandleApprovals(bot *tgbotapi.BotAPI, chatID, userID in
 		mode = "manual"
 	}
 	reply := fmt.Sprintf("🛡️ *Mode Persetujuan Perintah Sensitif (Approvals)*\n\n"+
-		"• *Status Saat Ini:* `%s`\n\n"+
+		"• *Status Saat Ini:* `%s`\n"+
+		"• *Self-Restart:* selalu minta persetujuan (✅/❌) walau YOLO aktif — diam 60 detik = TIDAK dijalankan.\n"+
+		"• *Perintah bahaya lain:* mengikuti mode YOLO. Matikan YOLO agar Hermes meminta persetujuan internal.\n"+
+		"• *Saat kartu approval muncul:* ketuk tombol atau ketik `/approve` / `/deny [alasan]`.\n\n"+
 		"_Gunakan `/yolo` untuk beralih antara eksekusi otomatis tanpa jeda konfirmasi atau konfirmasi manual._", mode)
 	dismissKb := DismissKeyboard()
 	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)

@@ -26,8 +26,10 @@ type Config struct {
 		SessionsPath string       `json:"sessions_path"`
 		GatewayURL   string       `json:"gateway_url"`
 		GatewayName  string       `json:"gateway_name"`
-		GatewayKey   string       `json:"gateway_key"`
-		Models       []ModelEntry `json:"models,omitempty"`
+		GatewayKey           string       `json:"gateway_key"`
+		InactivityTimeoutSec int          `json:"inactivity_timeout_sec,omitempty"`
+		MaxDurationSec        int          `json:"max_duration_sec,omitempty"`
+		Models               []ModelEntry `json:"models,omitempty"`
 	} `json:"hermes"`
 }
 
@@ -84,6 +86,12 @@ func LoadConfig(path string) (*Config, error) {
 		} else if envKey := os.Getenv("OPENAI_API_KEY"); envKey != "" {
 			cfg.Hermes.GatewayKey = envKey
 		}
+	}
+	if cfg.Hermes.InactivityTimeoutSec <= 0 {
+		cfg.Hermes.InactivityTimeoutSec = 300 // 5 minutes inactivity timeout
+	}
+	if cfg.Hermes.MaxDurationSec <= 0 {
+		cfg.Hermes.MaxDurationSec = 7200 // 2 hours hard ceiling safety net
 	}
 
 	// Ensure media directory exists

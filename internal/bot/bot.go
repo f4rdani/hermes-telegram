@@ -38,9 +38,20 @@ type BotServer struct {
 	queueMu     sync.Mutex
 	promptQueue map[int64][]QueuedTask
 	aggregator  *MessageAggregator
+	approvals   *ApprovalStore
+	// Background tasks (/bg): own registry, independent of the foreground per-user lock.
+	bgMu    sync.Mutex
+	bgTasks map[string]*BackgroundTask
+	bgSeq   int64
+	// Pending steer text (/steer): injected as followup after the running task ends.
+	steerMu      sync.Mutex
+	pendingSteer map[int64]string
+	// Global pause (/pause): new work is held while paused.
+	pausedMu sync.RWMutex
+	paused   bool
 }
 
-func NewBotServer(cfg *config.Config, version string) (*BotServer, error) {
+func NewBotServer(cfg *config.Config, configPath, version string) (*BotServer, error) {
 	bot, err := tgbotapi.NewBotAPI(cfg.Telegram.BotToken)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize telegram bot: %w", err)
@@ -58,15 +69,20 @@ func NewBotServer(cfg *config.Config, version string) (*BotServer, error) {
 	cmdHandler := NewCommandHandler(cfg, sessMgr, runner, modelResolver, version)
 
 	server := &BotServer{
-		bot:         bot,
-		cfg:         cfg,
-		sessMgr:     sessMgr,
-		runner:      runner,
-		cmdHandler:  cmdHandler,
-		version:     version,
-		promptQueue: make(map[int64][]QueuedTask),
-		aggregator:  NewMessageAggregator(),
+		bot:          bot,
+		cfg:          cfg,
+		sessMgr:      sessMgr,
+		runner:       runner,
+		cmdHandler:   cmdHandler,
+		version:      version,
+		promptQueue:  make(map[int64][]QueuedTask),
+		aggregator:   NewMessageAggregator(),
+		approvals:    NewApprovalStore(ApprovalTimeout),
+		bgTasks:      make(map[string]*BackgroundTask),
+		pendingSteer: make(map[int64]string),
 	}
+	server.cmdHandler.SetBgLinesProvider(server.listBackgroundLines)
+	server.cmdHandler.SetConfigPath(configPath)
 
 	server.registerCommands()
 
@@ -112,12 +128,94 @@ func (s *BotServer) listQueue(userID int64) []QueuedTask {
 	return append([]QueuedTask(nil), s.promptQueue[userID]...)
 }
 
+// queueRemove deletes the 0-based item. Returns the removed task and true on success.
+func (s *BotServer) queueRemove(userID int64, idx int) (QueuedTask, bool) {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	q := s.promptQueue[userID]
+	if idx < 0 || idx >= len(q) {
+		return QueuedTask{}, false
+	}
+	removed := q[idx]
+	s.promptQueue[userID] = append(q[:idx], q[idx+1:]...)
+	return removed, true
+}
+
+// queueEdit replaces the prompt of the 0-based item.
+func (s *BotServer) queueEdit(userID int64, idx int, prompt string) bool {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	q := s.promptQueue[userID]
+	if idx < 0 || idx >= len(q) {
+		return false
+	}
+	q[idx].Prompt = prompt
+	return true
+}
+
+// queueMove relocates the 0-based item from→to (to is clamped into range).
+func (s *BotServer) queueMove(userID int64, from, to int) bool {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	q := s.promptQueue[userID]
+	if from < 0 || from >= len(q) || to < 0 || to >= len(q) {
+		return false
+	}
+	if from == to {
+		return true
+	}
+	item := q[from]
+	q = append(q[:from], q[from+1:]...)
+	if to > len(q) {
+		to = len(q)
+	}
+	q = append(q, QueuedTask{})
+	copy(q[to+1:], q[to:])
+	q[to] = item
+	s.promptQueue[userID] = q
+	return true
+}
+
+// pushFrontTask inserts a task at the head of the queue (used for steer follow-ups).
+func (s *BotServer) pushFrontTask(task QueuedTask) {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	q := s.promptQueue[task.UserID]
+	q = append([]QueuedTask{task}, q...)
+	s.promptQueue[task.UserID] = q
+}
+
 func (s *BotServer) clearQueue(userID int64) int {
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
 	count := len(s.promptQueue[userID])
 	delete(s.promptQueue, userID)
 	return count
+}
+
+// isPauseCommand reports whether text invokes /pause (with optional @bot suffix).
+func isPauseCommand(text string) bool {
+	fields := strings.Fields(strings.TrimSpace(text))
+	if len(fields) == 0 {
+		return false
+	}
+	cmd := strings.ToLower(fields[0])
+	if i := strings.Index(cmd, "@"); i != -1 {
+		cmd = cmd[:i]
+	}
+	return cmd == "/pause"
+}
+
+func (s *BotServer) isPaused() bool {
+	s.pausedMu.RLock()
+	defer s.pausedMu.RUnlock()
+	return s.paused
+}
+
+func (s *BotServer) setPaused(p bool) {
+	s.pausedMu.Lock()
+	defer s.pausedMu.Unlock()
+	s.paused = p
 }
 
 func (s *BotServer) Start(ctx context.Context) error {
@@ -169,6 +267,9 @@ func (s *BotServer) handleCallbackQuery(cb *tgbotapi.CallbackQuery) {
 	switch {
 	case data == "cancel_task":
 		s.aggregator.Cancel(userID)
+		s.takePendingSteer(userID)
+		s.withdrawSelfRestartApproval(userID, "Tugas dibatalkan — perintah TIDAK dijalankan.")
+		s.stopUserBackgroundTasks(userID)
 		if s.runner.Stop(userID) {
 			_, _ = EditSafeMessage(s.bot, chatID, cb.Message.MessageID, "🛑 *Tugas telah dibatalkan oleh pengguna.*", nil)
 		}
@@ -216,6 +317,14 @@ func (s *BotServer) handleCallbackQuery(cb *tgbotapi.CallbackQuery) {
 		s.cmdHandler.HandleCommands(s.bot, chatID, page)
 		_, _ = s.bot.Request(tgbotapi.NewCallback(cb.ID, ""))
 
+	case strings.HasPrefix(data, "approve:sr:"):
+		requestID := strings.TrimPrefix(data, "approve:sr:")
+		s.resolveSelfRestartApproval(cb.ID, chatID, requestID, true, "")
+
+	case strings.HasPrefix(data, "deny:sr:"):
+		requestID := strings.TrimPrefix(data, "deny:sr:")
+		s.resolveSelfRestartApproval(cb.ID, chatID, requestID, false, "")
+
 	default:
 		_, _ = s.bot.Request(tgbotapi.NewCallback(cb.ID, ""))
 	}
@@ -229,6 +338,13 @@ func (s *BotServer) handleMessage(msg *tgbotapi.Message) {
 	if !s.cfg.IsAllowed(userID) {
 		log.Printf("[bot] Access denied for UserID %d in ChatID %d", userID, chatID)
 		_, _ = SendSafeMessage(s.bot, chatID, "⛔ *Akses Ditolak*\n\nUser ID Anda belum diizinkan dalam konfigurasi.", nil)
+		return
+	}
+
+	// Global pause (/pause): hold all new work except /pause itself.
+	if s.isPaused() && !isPauseCommand(text) {
+		sent, _ := SendSafeMessage(s.bot, chatID, "⏸️ *Gateway Dijeda.*\nPesan/media diabaikan. Gunakan `/pause off` untuk melanjutkan.", nil)
+		s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 		return
 	}
 
@@ -316,7 +432,7 @@ func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
 		s.cmdHandler.HandleYolo(s.bot, chatID, userID)
 	case "/busy":
 		s.cmdHandler.HandleBusy(s.bot, chatID, userID, arg)
-	case "/queue":
+	case "/queue", "/q":
 		s.handleQueueCommand(chatID, userID, arg)
 	case "/clean", "/prune":
 		s.handleCleanCommand(chatID, userID)
@@ -343,6 +459,12 @@ func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
 		s.cmdHandler.HandleVersion(s.bot, chatID)
 	case "/stop":
 		s.aggregator.Cancel(userID)
+		s.takePendingSteer(userID)
+		s.withdrawSelfRestartApproval(userID, "Tugas dibatalkan via /stop — perintah TIDAK dijalankan.")
+		if n := s.stopUserBackgroundTasks(userID); n > 0 {
+			sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("🛑 *%d background task ikut dibatalkan.*", n), nil)
+			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+		}
 		s.cmdHandler.HandleStop(s.bot, chatID, userID)
 	case "/ps", "/processes", "/procs":
 		s.cmdHandler.HandleProcessStatus(s.bot, chatID)
@@ -359,9 +481,9 @@ func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
 	case "/usage":
 		s.cmdHandler.HandleUsage(s.bot, chatID, userID, arg)
 	case "/approve":
-		s.cmdHandler.HandleApprove(s.bot, chatID, userID, arg)
+		s.handleApproveTextCommand(chatID, userID, arg)
 	case "/deny":
-		s.cmdHandler.HandleDeny(s.bot, chatID, userID, arg)
+		s.handleDenyTextCommand(chatID, userID, arg)
 	case "/compress", "/compact":
 		s.cmdHandler.HandleCompress(s.bot, chatID, userID, arg)
 	case "/sendfile", "/send":
@@ -377,6 +499,12 @@ func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
 	case "/branch", "/fork":
 		s.cmdHandler.HandleBranch(s.bot, chatID, userID, arg)
 	case "/pause":
+		lowArg := strings.ToLower(strings.TrimSpace(arg))
+		if lowArg == "off" || lowArg == "resume" || lowArg == "0" || lowArg == "no" {
+			s.setPaused(false)
+		} else {
+			s.setPaused(true)
+		}
 		s.cmdHandler.HandlePause(s.bot, chatID, arg)
 	case "/agents", "/tasks":
 		s.cmdHandler.HandleAgents(s.bot, chatID, userID)
@@ -474,14 +602,7 @@ func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
 		}
 		s.executeTask(chatID, userID, prompt, "", "", 1)
 	case "/bg":
-		if arg == "" {
-			sent, _ := SendSafeMessage(s.bot, chatID, "⚙️ *Tugas Latar Belakang (Background Task):*\n\nFormat: `/bg <instruksi tugas>`\nMenjalankan tugas di sesi latar belakang independen.", nil)
-			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
-			return
-		}
-		go func() {
-			s.executeTask(chatID, userID, arg, "", "", 1)
-		}()
+		s.handleBgCommand(chatID, userID, arg)
 	case "/btw":
 		if arg == "" {
 			sent, _ := SendSafeMessage(s.bot, chatID, "💬 *Pertanyaan Sampingan (By The Way):*\n\nFormat: `/btw <pertanyaan singkat>`\nMenanyakan pertanyaan sampingan tanpa merusak alur fokus.", nil)
@@ -490,12 +611,7 @@ func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
 		}
 		s.executeTask(chatID, userID, fmt.Sprintf("[Pertanyaan Sampingan (BTW)]: %s", arg), "", "", 1)
 	case "/steer":
-		if arg == "" {
-			sent, _ := SendSafeMessage(s.bot, chatID, "🧭 *Steer Agent:*\n\nFormat: `/steer <arahan tindakan berikutnya>`", nil)
-			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
-			return
-		}
-		s.handleQueueCommand(chatID, userID, arg)
+		s.handleSteerCommand(chatID, userID, arg)
 	default:
 		skillName := strings.TrimPrefix(cmd, "/")
 		skillsDir := filepath.Join(s.cfg.Hermes.HermesHome, "skills")
@@ -515,14 +631,7 @@ func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
 
 func (s *BotServer) handleQueueCommand(chatID, userID int64, arg string) {
 	arg = strings.TrimSpace(arg)
-	if arg == "clear" {
-		count := s.clearQueue(userID)
-		sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("🗑️ *Antrean Dikosongkan:*\n%d tugas di antrean telah dibatalkan.", count), nil)
-		s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
-		return
-	}
-
-	if arg == "" || arg == "list" {
+	if arg == "" || strings.EqualFold(arg, "list") {
 		q := s.listQueue(userID)
 		if len(q) == 0 {
 			sent, _ := SendSafeMessage(s.bot, chatID, "ℹ️ Antrean kosong. Tidak ada pesan yang menunggu.", nil)
@@ -534,10 +643,94 @@ func (s *BotServer) handleQueueCommand(chatID, userID int64, arg string) {
 		for i, t := range q {
 			sb.WriteString(fmt.Sprintf("%d. `%s`\n   ⏱ _Diantrekan: %s_\n\n", i+1, truncate(t.Prompt, 50), t.EnqueuedAt.Format("15:04:05")))
 		}
-		sb.WriteString("_Ketik `/queue clear` untuk menghapus seluruh antrean._")
+		sb.WriteString("_Kelola:_ `/queue edit N <prompt>` • `/queue rm N` • `/queue move A B` • `/queue clear`")
 		sent, _ := SendSafeMessage(s.bot, chatID, sb.String(), nil)
 		s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 		return
+	}
+
+	fields := strings.Fields(arg)
+	sub := strings.ToLower(fields[0])
+
+	switch sub {
+	case "clear":
+		count := s.clearQueue(userID)
+		sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("🗑️ *Antrean Dikosongkan:*\n%d tugas di antrean telah dibatalkan.", count), nil)
+		s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+		return
+	case "rm", "remove", "del", "delete":
+		if len(fields) < 2 {
+			sent, _ := SendSafeMessage(s.bot, chatID, "ℹ️ Format: `/queue rm N` — hapus item antrean nomor N. Lihat nomor via `/queue list`.", nil)
+			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			return
+		}
+		n, err := strconv.Atoi(fields[1])
+		if err != nil {
+			sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("❌ Nomor tidak valid: `%s`.", fields[1]), nil)
+			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			return
+		}
+		removed, ok := s.queueRemove(userID, n-1)
+		if !ok {
+			sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("❌ Item #%d tidak ada. Cek `/queue list`.", n), nil)
+			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			return
+		}
+		sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("🗑️ *Item #%d Dihapus:*\n`%s`", n, truncate(removed.Prompt, 80)), nil)
+		s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+		return
+	case "edit":
+		if len(fields) < 3 {
+			sent, _ := SendSafeMessage(s.bot, chatID, "ℹ️ Format: `/queue edit N <prompt baru>` — ubah isi item antrean nomor N.", nil)
+			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			return
+		}
+		n, err := strconv.Atoi(fields[1])
+		if err != nil {
+			sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("❌ Nomor tidak valid: `%s`.", fields[1]), nil)
+			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			return
+		}
+		// Preserve original spacing of the new prompt: strip "edit N " prefix.
+		rest := strings.TrimSpace(arg[len(fields[0]):])
+		rest = strings.TrimSpace(rest[len(fields[1]):])
+		if !s.queueEdit(userID, n-1, rest) {
+			sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("❌ Item #%d tidak ada. Cek `/queue list`.", n), nil)
+			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			return
+		}
+		sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("✏️ *Item #%d Diperbarui:*\n`%s`", n, truncate(rest, 80)), nil)
+		s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+		return
+	case "move":
+		if len(fields) < 3 {
+			sent, _ := SendSafeMessage(s.bot, chatID, "ℹ️ Format: `/queue move A B` — pindahkan item nomor A ke posisi B.", nil)
+			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			return
+		}
+		a, errA := strconv.Atoi(fields[1])
+		b, errB := strconv.Atoi(fields[2])
+		if errA != nil || errB != nil {
+			sent, _ := SendSafeMessage(s.bot, chatID, "❌ Nomor tidak valid. Format: `/queue move A B`.", nil)
+			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			return
+		}
+		if !s.queueMove(userID, a-1, b-1) {
+			sent, _ := SendSafeMessage(s.bot, chatID, "❌ Nomor di luar jangkauan. Cek `/queue list`.", nil)
+			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			return
+		}
+		sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("🔀 *Item #%d dipindahkan ke posisi #%d.*", a, b), nil)
+		s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+		return
+	case "add":
+		prompt := strings.TrimSpace(arg[len(fields[0]):])
+		if prompt == "" {
+			sent, _ := SendSafeMessage(s.bot, chatID, "ℹ️ Format: `/queue add <prompt>`.", nil)
+			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+			return
+		}
+		arg = prompt
 	}
 
 	// Manual enqueue: /queue <prompt>
@@ -686,95 +879,254 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 	}
 	defer lock.Unlock()
 
-	userSess := s.sessMgr.Get(userID, chatID)
 	s.sessMgr.SetLastPrompt(userID, prompt, imagePath)
 
 	cancelKb := CancelKeyboard()
-	var statusText string
+	currentPrompt := prompt
+	currentImagePath := imagePath
+	maxAttempts := 2
+
+	inactTimeout := 5 * time.Minute
+	if s.cfg.Hermes.InactivityTimeoutSec > 0 {
+		inactTimeout = time.Duration(s.cfg.Hermes.InactivityTimeoutSec) * time.Second
+	}
+	hardTimeout := 2 * time.Hour
+	if s.cfg.Hermes.MaxDurationSec > 0 {
+		hardTimeout = time.Duration(s.cfg.Hermes.MaxDurationSec) * time.Second
+	}
+
+	var statusMsg tgbotapi.Message
+	hasStatusMsg := false
+
 	if partsCount > 1 {
-		statusText = fmt.Sprintf("🌸 *Aida sedang menjalankan tugas...*\n_📦 Menggabungkan %d potongan pesan menjadi 1 prompt utuh (%d karakter)_\n\n💭 _Sedang menganalisis instruksi..._", partsCount, len([]rune(prompt)))
+		statusText := fmt.Sprintf("🌸 *Aida sedang menjalankan tugas...*\n_📦 Menggabungkan %d potongan pesan menjadi 1 prompt utuh (%d karakter)_\n\n💭 _Sedang menganalisis instruksi..._", partsCount, len([]rune(prompt)))
+		msg, err := SendSafeMessage(s.bot, chatID, statusText, cancelKb)
+		if err == nil {
+			statusMsg = msg
+			hasStatusMsg = true
+			s.sessMgr.AddTelegramMsgID(userID, statusMsg.MessageID)
+		}
 	} else {
-		statusText = "🌸 *Aida sedang menjalankan tugas...*\n\n💭 _Sedang berpikir & menganalisis instruksi..._"
-	}
-	statusMsg, err := SendSafeMessage(s.bot, chatID, statusText, cancelKb)
-	hasStatusMsg := (err == nil)
-	if hasStatusMsg {
-		s.sessMgr.AddTelegramMsgID(userID, statusMsg.MessageID)
-	}
-
-	stopTyping := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(4 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stopTyping:
-				return
-			case <-ticker.C:
-				action := tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping)
-				_, _ = s.bot.Send(action)
-			}
+		statusText := "🌸 *Aida sedang menjalankan tugas...*\n\n💭 _Sedang berpikir & menganalisis instruksi..._"
+		msg, err := SendSafeMessage(s.bot, chatID, statusText, cancelKb)
+		if err == nil {
+			statusMsg = msg
+			hasStatusMsg = true
+			s.sessMgr.AddTelegramMsgID(userID, statusMsg.MessageID)
 		}
-	}()
+	}
 
-	startTime := time.Now()
-	log.Printf("[bot] Task starting for User %d (Session: %s, Model: %s)",
-		userID, userSess.CurrentSessionID, userSess.CurrentModel)
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		userSess := s.sessMgr.Get(userID, chatID)
+		startTime := time.Now()
 
-	taskTimeout := 15 * time.Minute
-	ctx, cancel := context.WithTimeout(context.Background(), taskTimeout)
-	defer cancel()
-
-	opts := engine.RunOptions{
-		Prompt:          prompt,
-		ImagePath:       imagePath,
-		SessionID:       userSess.CurrentSessionID,
-		Model:           userSess.CurrentModel,
-		ReasoningEffort: userSess.ReasoningEffort,
-		Yolo:            userSess.YoloMode,
-		PreloadSkills:   preloadSkills,
-		WorkingDir:      s.cfg.Hermes.WorkingDir,
-		Timeout:         taskTimeout,
-		OnProgress: func(displayText string) {
+		if attempt > 0 {
+			recoveryNotice := fmt.Sprintf("⚠️ *Deteksi Terhenti / Stuck — Auto-Recovery Berjalan...*\n\n_Melanjutkan pekerjaan di sesi `%s` dan menyiapkan laporan progress..._", userSess.CurrentSessionID)
 			if hasStatusMsg {
-				_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, displayText, &cancelKb)
+				_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, recoveryNotice, &cancelKb)
+			} else {
+				msg, err := SendSafeMessage(s.bot, chatID, recoveryNotice, cancelKb)
+				if err == nil {
+					statusMsg = msg
+					hasStatusMsg = true
+					s.sessMgr.AddTelegramMsgID(userID, statusMsg.MessageID)
+				}
 			}
-		},
-	}
-
-	result, runErr := s.runner.Execute(ctx, userID, opts)
-	close(stopTyping)
-	duration := time.Since(startTime).Round(time.Millisecond)
-
-	if runErr != nil {
-		log.Printf("[bot] Task error (%v): %v", duration, runErr)
-
-		var sb strings.Builder
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) || strings.Contains(runErr.Error(), "timeout") {
-			sb.WriteString(fmt.Sprintf("⏱️ *Batas Waktu Eksekusi Terlampaui (Timeout %v)*\n\n_Operasi dihentikan otomatis karena mencapai batas waktu maksimal._\n\n", duration))
-		} else if strings.Contains(runErr.Error(), "dibatalkan") {
-			sb.WriteString("🛑 *Operasi Dibatalkan oleh Pengguna*\n\n")
-		} else {
-			sb.WriteString(fmt.Sprintf("❌ *Gagal Mengeksekusi Tugas (%v):*\n\n```\n%v\n```\n\n", duration, runErr))
 		}
 
-		if result != nil && len(result.ToolHistory) > 0 {
-			sb.WriteString("⚙️ *Aktivitas Tools Terakhir:*\n")
-			start := 0
-			if len(result.ToolHistory) > 6 {
-				start = len(result.ToolHistory) - 6
+		stopTyping := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(4 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopTyping:
+					return
+				case <-ticker.C:
+					action := tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping)
+					_, _ = s.bot.Send(action)
+				}
 			}
-			for _, th := range result.ToolHistory[start:] {
-				sb.WriteString(fmt.Sprintf("• %s\n", th))
-			}
-			sb.WriteString("\n")
+		}()
+
+		log.Printf("[bot] Task starting for User %d (Attempt: %d, Session: %s, Model: %s)",
+			userID, attempt, userSess.CurrentSessionID, userSess.CurrentModel)
+
+		// Heartbeat + self-restart approval state (per-task, guarded by mutex).
+		var progMu sync.Mutex
+		lastDisplay := "🌸 *Aida sedang menjalankan tugas...*\n\n💭 _Sedang berpikir & menganalisis instruksi..._"
+		if attempt > 0 {
+			lastDisplay = "⚠️ *Auto-Recovery Berjalan...*\n\n💭 _Menganalisis status dan melanjutkan pekerjaan..._"
+		}
+		lastUpdate := time.Now()
+		approvalCardSent := false
+
+		opts := engine.RunOptions{
+			Prompt:            currentPrompt,
+			ImagePath:         currentImagePath,
+			SessionID:         userSess.CurrentSessionID,
+			Model:             userSess.CurrentModel,
+			ReasoningEffort:   userSess.ReasoningEffort,
+			Yolo:              userSess.YoloMode,
+			PreloadSkills:     preloadSkills,
+			WorkingDir:        s.cfg.Hermes.WorkingDir,
+			Timeout:           hardTimeout,
+			InactivityTimeout: inactTimeout,
+			OnProgress: func(displayText string) {
+				progMu.Lock()
+				lastDisplay = displayText
+				lastUpdate = time.Now()
+				// Self-restart always asks, even with YOLO ON (fail-closed, 60s → deny).
+				needCard := !approvalCardSent && isSelfRestartCriticalText(displayText)
+				if needCard {
+					approvalCardSent = true
+				}
+				progMu.Unlock()
+
+				if hasStatusMsg {
+					_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, displayText, &cancelKb)
+				}
+				if needCard {
+					s.sendSelfRestartApprovalCard(chatID, userID, engine.ForegroundKey(userID), displayText)
+				}
+			},
 		}
 
-		if result != nil && strings.TrimSpace(result.FinalText) != "" {
-			sb.WriteString("💬 *Catatan/Keluaran Terakhir Sebelum Terhenti:*\n")
-			sb.WriteString(strings.TrimSpace(result.FinalText))
-			sb.WriteString("\n")
+		// Heartbeat: keep editing the status message with elapsed time so it never looks stuck/dead.
+		go func() {
+			ticker := time.NewTicker(12 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopTyping:
+					return
+				case <-ticker.C:
+					progMu.Lock()
+					stale := time.Since(lastUpdate)
+					base := lastDisplay
+					progMu.Unlock()
+					if stale < 12*time.Second || !hasStatusMsg {
+						continue
+					}
+					elapsed := time.Since(startTime).Round(time.Second)
+					hb := fmt.Sprintf("%s\n\n⏳ _Masih berjalan... (%s) — Aida aktif bekerja..._\n_Gunakan /stop untuk batalkan._", base, elapsed)
+					_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, hb, &cancelKb)
+				}
+			}
+		}()
+
+		result, runErr := s.runner.Execute(context.Background(), userID, opts)
+		close(stopTyping)
+		duration := time.Since(startTime).Round(time.Millisecond)
+
+		if runErr != nil {
+			log.Printf("[bot] Task error for User %d (Attempt %d, %v): %v", userID, attempt, duration, runErr)
+
+			isStuck := errors.Is(runErr, engine.ErrInactivityTimeout) || (result != nil && result.IsStuck)
+
+			// If stuck on attempt 0: trigger auto-recovery!
+			if isStuck && attempt == 0 {
+				log.Printf("[bot] Task stuck for User %d after %v inactivity. Triggering auto-recovery attempt 1...", userID, inactTimeout)
+				if result != nil && result.SessionID != "" {
+					s.sessMgr.SetSessionID(userID, result.SessionID)
+				}
+				s.withdrawSelfRestartApproval(userID, "")
+
+				stuckNotice := fmt.Sprintf("⚠️ *Deteksi Terhenti / Stuck (%v):*\n_Tidak ada respons atau progres baru selama %v. Aida menghentikan subproses yang macet dan otomatis melanjutkan pekerjaan serta menyiapkan laporan progress..._\n\n⏳ _Menghubungi Aida untuk recovery..._", inactTimeout, inactTimeout)
+				if hasStatusMsg {
+					_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, stuckNotice, &cancelKb)
+				}
+				time.Sleep(1 * time.Second)
+
+				currentPrompt = fmt.Sprintf("[Sistem Auto-Recovery]: Perintah atau proses sebelumnya terhenti karena tidak ada respons/aktivitas selama %v (stuck). Tolong periksa kondisi sistem dan file saat ini, lanjutkan pekerjaan yang belum selesai jika memungkinkan, dan berikan laporan progress terkini serta kendala yang terjadi kepada user.", inactTimeout)
+				currentImagePath = ""
+				continue
+			}
+
+			// Otherwise, report final error to user
+			var sb strings.Builder
+			if isStuck {
+				sb.WriteString(fmt.Sprintf("⏱️ *Batas Waktu Hening Terlampaui (Stuck %v)*\n\n_Operasi dihentikan otomatis karena tidak ada respons/aktivitas selama %v, dan pemulihan otomatis tidak berhasil._\n\n", inactTimeout, inactTimeout))
+			} else if errors.Is(runErr, engine.ErrHardTimeout) {
+				sb.WriteString(fmt.Sprintf("⏱️ *Batas Waktu Maksimal Terlampaui (Hard Ceiling %v)*\n\n_Operasi dihentikan otomatis karena mencapai batas waktu maksimal tugas._\n\n", hardTimeout))
+			} else if errors.Is(runErr, engine.ErrUserCanceled) || strings.Contains(runErr.Error(), "dibatalkan") {
+				sb.WriteString("🛑 *Operasi Dibatalkan oleh Pengguna*\n\n")
+			} else {
+				sb.WriteString(fmt.Sprintf("❌ *Gagal Mengeksekusi Tugas (%v):*\n\n```\n%v\n```\n\n", duration, runErr))
+			}
+
+			if result != nil && len(result.ToolHistory) > 0 {
+				sb.WriteString("⚙️ *Aktivitas Tools Terakhir:*\n")
+				start := 0
+				if len(result.ToolHistory) > 6 {
+					start = len(result.ToolHistory) - 6
+				}
+				for _, th := range result.ToolHistory[start:] {
+					sb.WriteString(fmt.Sprintf("• %s\n", th))
+				}
+				sb.WriteString("\n")
+			}
+
+			if result != nil && strings.TrimSpace(result.FinalText) != "" {
+				sb.WriteString("💬 *Catatan/Keluaran Terakhir Sebelum Terhenti:*\n")
+				sb.WriteString(strings.TrimSpace(result.FinalText))
+				sb.WriteString("\n")
+			}
+
+			activeSessionID := userSess.CurrentSessionID
+			if result != nil && result.SessionID != "" {
+				activeSessionID = result.SessionID
+			}
+			activeModel := userSess.CurrentModel
+			if activeModel == "" && s.cfg != nil {
+				activeModel = s.cfg.Hermes.DefaultModel
+			}
+			footer := s.formatResultFooter(duration, result, activeSessionID, activeModel)
+			sb.WriteString(footer)
+
+			errMsg := sb.String()
+			chunks := SplitMessage(errMsg, 30000)
+			if hasStatusMsg && len(chunks) > 0 {
+				_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, chunks[0], nil)
+				for _, chunk := range chunks[1:] {
+					sent, _ := SendSafeMessage(s.bot, chatID, chunk, nil)
+					s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+				}
+			} else {
+				for _, chunk := range chunks {
+					sent, _ := SendSafeMessage(s.bot, chatID, chunk, nil)
+					s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+				}
+			}
+			s.pruneOldTelegramMessages(chatID, userID)
+			s.withdrawSelfRestartApproval(userID, "")
+			if !errors.Is(runErr, engine.ErrUserCanceled) && !strings.Contains(runErr.Error(), "dibatalkan") {
+				if s.maybeInjectSteerFollowup(chatID, userID) {
+					log.Printf("[bot] Steer follow-up queued for user %d", userID)
+				}
+			}
+			s.checkAndRunNextQueuedTask(userID)
+			return
 		}
+
+		// Task succeeded!
+		if result != nil && result.SessionID != "" {
+			s.sessMgr.SetSessionID(userID, result.SessionID)
+		}
+
+		finalText := ""
+		if result != nil {
+			finalText = strings.TrimSpace(result.FinalText)
+		}
+
+		if finalText == "" {
+			finalText = fmt.Sprintf("✅ *Tugas selesai dalam %v tanpa keluaran teks.*", duration)
+		} else if attempt > 0 {
+			finalText = "🔄 *[Auto-Recovery Sukses]*\n_Aida berhasil melanjutkan tugas setelah sempat terhenti:_\n\n" + finalText
+		}
+
+		// Intercept and send any outbound files/images/videos directly to Telegram!
+		finalText = s.ProcessOutboundMedia(chatID, userID, finalText)
 
 		activeSessionID := userSess.CurrentSessionID
 		if result != nil && result.SessionID != "" {
@@ -784,11 +1136,11 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 		if activeModel == "" && s.cfg != nil {
 			activeModel = s.cfg.Hermes.DefaultModel
 		}
-		footer := s.formatResultFooter(duration, result, activeSessionID, activeModel)
-		sb.WriteString(footer)
 
-		errMsg := sb.String()
-		chunks := SplitMessage(errMsg, 30000)
+		footer := s.formatResultFooter(duration, result, activeSessionID, activeModel)
+		fullResponse := finalText + footer
+
+		chunks := SplitMessage(fullResponse, 30000)
 		if hasStatusMsg && len(chunks) > 0 {
 			_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, chunks[0], nil)
 			for _, chunk := range chunks[1:] {
@@ -801,63 +1153,20 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 				s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 			}
 		}
+
+		log.Printf("[bot] Task completed successfully in %v (Session: %s, Chunks: %d, Attempt: %d)",
+			duration, userSess.CurrentSessionID, len(chunks), attempt)
+
 		s.pruneOldTelegramMessages(chatID, userID)
+		s.withdrawSelfRestartApproval(userID, "")
+
+		if s.maybeInjectSteerFollowup(chatID, userID) {
+			log.Printf("[bot] Steer follow-up queued for user %d", userID)
+		}
+
 		s.checkAndRunNextQueuedTask(userID)
 		return
 	}
-
-	// Update session ID if generated/changed
-	if result != nil && result.SessionID != "" {
-		s.sessMgr.SetSessionID(userID, result.SessionID)
-	}
-
-	finalText := ""
-	if result != nil {
-		finalText = strings.TrimSpace(result.FinalText)
-	}
-
-	if finalText == "" {
-		finalText = fmt.Sprintf("✅ *Tugas selesai dalam %v tanpa keluaran teks.*", duration)
-	}
-
-	// Intercept and send any outbound files/images (MEDIA:<path>, FILE:<path>, etc.) directly to Telegram!
-	finalText = s.ProcessOutboundMedia(chatID, userID, finalText)
-
-	activeSessionID := userSess.CurrentSessionID
-	if result != nil && result.SessionID != "" {
-		activeSessionID = result.SessionID
-	}
-	activeModel := userSess.CurrentModel
-	if activeModel == "" && s.cfg != nil {
-		activeModel = s.cfg.Hermes.DefaultModel
-	}
-
-	footer := s.formatResultFooter(duration, result, activeSessionID, activeModel)
-	fullResponse := finalText + footer
-
-	// Deliver response chunks (Telegram 12.9 Rich Message limit 32768, safe margin 30000)
-	chunks := SplitMessage(fullResponse, 30000)
-	if hasStatusMsg && len(chunks) > 0 {
-		_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, chunks[0], nil)
-		for _, chunk := range chunks[1:] {
-			sent, _ := SendSafeMessage(s.bot, chatID, chunk, nil)
-			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
-		}
-	} else {
-		for _, chunk := range chunks {
-			sent, _ := SendSafeMessage(s.bot, chatID, chunk, nil)
-			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
-		}
-	}
-
-	log.Printf("[bot] Task completed successfully in %v (Session: %s, Chunks: %d)",
-		duration, userSess.CurrentSessionID, len(chunks))
-
-	// Prune old messages in Telegram chat (max 50 turns = 100 messages)
-	s.pruneOldTelegramMessages(chatID, userID)
-
-	// Check and run next queued task FIFO!
-	s.checkAndRunNextQueuedTask(userID)
 }
 
 func (s *BotServer) checkAndRunNextQueuedTask(userID int64) {
@@ -890,6 +1199,26 @@ func truncate(s string, max int) string {
 		return s[:max] + "..."
 	}
 	return s
+}
+
+// isSelfRestartRiskText detects self-restart patterns in the live tool-activity text.
+// Runs on the gateway side only for warning purposes — execution is NOT blocked per user request.
+func isSelfRestartRiskText(displayText string) bool {
+	lower := strings.ToLower(displayText)
+	hasSystemctl := strings.Contains(lower, "systemctl")
+	hasHermesTele := strings.Contains(lower, "hermes-tele")
+	hasGoBuild := strings.Contains(lower, "go build")
+	hasAppsHermes := strings.Contains(lower, "apps/hermes-tele")
+
+	// systemctl ... hermes-tele (restart/stop/start) from inside its own task = self-kill deadlock
+	if hasSystemctl && hasHermesTele {
+		return true
+	}
+	// go build inside the bot folder from inside its own task = binary replaced mid-run
+	if hasGoBuild && (hasHermesTele || hasAppsHermes) {
+		return true
+	}
+	return false
 }
 
 func (s *BotServer) formatResultFooter(duration time.Duration, result *engine.RunResult, sessionID string, model string) string {

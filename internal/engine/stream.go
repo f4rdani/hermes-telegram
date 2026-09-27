@@ -47,6 +47,7 @@ type RunResult struct {
 	ExitCode    int
 	Error       string
 	ToolHistory []string
+	IsStuck     bool
 }
 
 func ParseEvent(line []byte) (*StreamEvent, error) {

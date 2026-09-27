@@ -12,7 +12,7 @@ import (
 	"hermes-tele/internal/bot"
 )
 
-var version = "2.2.2"
+var version = "2.3.0"
 
 func main() {
 	configPath := flag.String("config", "config.json", "Path to config JSON file")
@@ -32,7 +32,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	server, err := bot.NewBotServer(cfg, version)
+	server, err := bot.NewBotServer(cfg, *configPath, version)
 	if err != nil {
 		log.Fatalf("[hermes-tele] Fatal: Gagal menginisialisasi bot server: %v", err)
 	}

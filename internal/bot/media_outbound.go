@@ -20,6 +20,10 @@ var (
 
 	// Matches markdown file link syntax: [title](/path/to/file.ext)
 	markdownLinkRegex = regexp.MustCompile(`\[([^\]]+)\]\(([/\w\.-]+\.(?:txt|pdf|zip|tar\.gz|gz|csv|json|py|go|sh|html|css|md|png|jpg|jpeg|webp|gif|mp4|mov|mkv|webm|mp3|m4a|ogg|wav))\)`)
+
+	// Fallback: bare absolute paths to video files without any tag, e.g. "/root/video.mp4"
+	// Catches cases where the agent forgets VIDEO: prefix or markdown wrapping.
+	plainVideoPathRegex = regexp.MustCompile(`(?m)(^|\s)(/[^\s` + "`" + `\"'\]\)]+?\.(?:mp4|mov|mkv|webm))`)
 )
 
 type ExtractedMedia struct {
@@ -52,6 +56,7 @@ func (s *BotServer) ProcessOutboundMedia(chatID, userID int64, text string) stri
 	}
 
 	// 2. Scan for markdown images: ![alt](/path)
+	// NOTE: video files are sometimes emitted as ![title](/path.mp4) — treat them as video, not photo.
 	imgMatches := markdownImageRegex.FindAllStringSubmatch(text, -1)
 	for _, m := range imgMatches {
 		if len(m) > 2 {
@@ -59,9 +64,11 @@ func (s *BotServer) ProcessOutboundMedia(chatID, userID int64, text string) stri
 			p := strings.TrimSpace(m[2])
 			if !seenPaths[p] && fileExists(p) {
 				seenPaths[p] = true
+				isVid := isVideoFile(p)
 				mediaList = append(mediaList, ExtractedMedia{
 					FilePath: p,
-					IsImage:  true,
+					IsImage:  !isVid && isImageFile(p),
+					IsVideo:  isVid,
 					Caption:  alt,
 				})
 			}
@@ -76,22 +83,43 @@ func (s *BotServer) ProcessOutboundMedia(chatID, userID int64, text string) stri
 			p := strings.TrimSpace(m[2])
 			if !seenPaths[p] && fileExists(p) {
 				seenPaths[p] = true
+				isVid := isVideoFile(p)
 				mediaList = append(mediaList, ExtractedMedia{
 					FilePath: p,
-					IsImage:  isImageFile(p),
-					IsVideo:  isVideoFile(p),
+					IsImage:  !isVid && isImageFile(p),
+					IsVideo:  isVid,
 					Caption:  title,
 				})
 			}
 		}
 	}
 
+	// 3b. Fallback: bare absolute video paths without VIDEO: tag or markdown.
+	// Ensures "kadang file kadang video" never happens just because the agent forgot the prefix.
+	plainMatches := plainVideoPathRegex.FindAllStringSubmatch(text, -1)
+	for _, m := range plainMatches {
+		if len(m) > 2 {
+			p := strings.TrimSpace(m[2])
+			if !seenPaths[p] && fileExists(p) && isVideoFile(p) {
+				seenPaths[p] = true
+				mediaList = append(mediaList, ExtractedMedia{
+					FilePath: p,
+					IsImage:  false,
+					IsVideo:  true,
+				})
+			}
+		}
+	}
+
 	// 4. Send all extracted files/images/videos directly to Telegram
+	// Policy: try native playable video first, fallback to document on failure (e.g. >50MB Bot API limit).
+	// No auto-compress per user request — oversized videos arrive as files with a clear label.
 	for _, item := range mediaList {
 		switch {
 		case item.IsVideo:
 			// VIDEO = native playable video bubble (streams inline, no download needed)
 			vid := tgbotapi.NewVideo(chatID, tgbotapi.FilePath(item.FilePath))
+			vid.SupportsStreaming = true
 			if item.Caption != "" {
 				vid.Caption = item.Caption
 			}
@@ -103,7 +131,10 @@ func (s *BotServer) ProcessOutboundMedia(chatID, userID int64, text string) stri
 					doc.Caption = item.Caption
 				}
 				if sentDoc, errDoc := s.bot.Send(doc); errDoc == nil {
+					log.Printf("[bot] Successfully sent document (video fallback) %s (msg_id: %d)", item.FilePath, sentDoc.MessageID)
 					s.sessMgr.AddTelegramMsgID(userID, sentDoc.MessageID)
+				} else {
+					log.Printf("[bot] Failed to send outbound document fallback (%s): %v", item.FilePath, errDoc)
 				}
 			} else {
 				log.Printf("[bot] Successfully sent video %s (msg_id: %d)", item.FilePath, sent.MessageID)
@@ -144,6 +175,11 @@ func (s *BotServer) ProcessOutboundMedia(chatID, userID int64, text string) stri
 		case isVideoFile(p):
 			re := regexp.MustCompile(`(?m)^.*(?:VIDEO|MEDIA|FILE|DOCUMENT):\s*[` + "`" + `\"'\"]?` + regexp.QuoteMeta(p) + `[` + "`" + `\"'\"]?.*$\n?`)
 			cleanText = re.ReplaceAllString(cleanText, fmt.Sprintf("🎬 _[Video terkirim: `%s`]\n", base))
+			// Also collapse markdown image/link wrappers for videos to the same notice.
+			reImg := regexp.MustCompile(`!\[[^\]]*\]\(` + regexp.QuoteMeta(p) + `\)`)
+			cleanText = reImg.ReplaceAllString(cleanText, fmt.Sprintf("🎬 _[Video terkirim: `%s`]", base))
+			reLink := regexp.MustCompile(`\[[^\]]+\]\(` + regexp.QuoteMeta(p) + `\)`)
+			cleanText = reLink.ReplaceAllString(cleanText, fmt.Sprintf("🎬 _[Video terkirim: `%s`]", base))
 		case isImageFile(p):
 			re := regexp.MustCompile(`(?m)^.*(?:VIDEO|MEDIA|FILE|DOCUMENT):\s*[` + "`" + `\"'\"]?` + regexp.QuoteMeta(p) + `[` + "`" + `\"'\"]?.*$\n?`)
 			cleanText = re.ReplaceAllString(cleanText, fmt.Sprintf("🖼️ _[Foto / Screenshot terkirim: `%s`]\n", base))

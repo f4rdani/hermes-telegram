@@ -33,6 +33,8 @@ type RunOptions struct {
 	WorkingDir        string
 	Timeout           time.Duration // Hard safety ceiling (default: 2 hours)
 	InactivityTimeout time.Duration // Inactivity/AFK timeout (default: 5 minutes)
+	StartTime         time.Time     // Task start time for header duration
+	IsRecovery        bool          // True if running auto-recovery attempt
 	OnProgress        func(displayText string)
 }
 
@@ -268,6 +270,11 @@ func (r *Runner) ExecuteWithKey(ctx context.Context, key string, userID int64, o
 		}
 	}()
 
+	runStart := time.Now()
+	if !opts.StartTime.IsZero() {
+		runStart = opts.StartTime
+	}
+
 	triggerProgress := func(force bool) {
 		if opts.OnProgress == nil {
 			return
@@ -279,7 +286,12 @@ func (r *Runner) ExecuteWithKey(ctx context.Context, key string, userID int64, o
 		lastProgress = now
 
 		var sb strings.Builder
-		sb.WriteString("🌸 *Aida sedang menjalankan tugas...*\n\n")
+		elapsed := time.Since(runStart).Round(time.Second)
+		if opts.IsRecovery {
+			sb.WriteString(fmt.Sprintf("⚠️ *Auto-Recovery Berjalan...* (%s)\n\n", elapsed))
+		} else {
+			sb.WriteString(fmt.Sprintf("🌸 *Aida sedang menjalankan tugas...* (%s)\n\n", elapsed))
+		}
 
 		// Display tool execution history
 		if len(toolHistory) > 0 {

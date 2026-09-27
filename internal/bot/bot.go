@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -845,6 +846,25 @@ func skillExists(skillsDir, skillName string) bool {
 	return false
 }
 
+var (
+	headerElapsedRegex         = regexp.MustCompile(`(?m)^🌸 \*Aida sedang menjalankan tugas\.\.\.\*(?: \([^)]+\))?`)
+	recoveryHeaderElapsedRegex = regexp.MustCompile(`(?m)^⚠️ \*Auto-Recovery Berjalan\.\.\.\*(?: \([^)]+\))?`)
+)
+
+func updateHeaderElapsed(base string, elapsed time.Duration, isRecovery bool) string {
+	durStr := elapsed.Round(time.Second).String()
+	if isRecovery {
+		if recoveryHeaderElapsedRegex.MatchString(base) {
+			return recoveryHeaderElapsedRegex.ReplaceAllString(base, fmt.Sprintf("⚠️ *Auto-Recovery Berjalan...* (%s)", durStr))
+		}
+		return fmt.Sprintf("⚠️ *Auto-Recovery Berjalan...* (%s)\n\n%s", durStr, base)
+	}
+	if headerElapsedRegex.MatchString(base) {
+		return headerElapsedRegex.ReplaceAllString(base, fmt.Sprintf("🌸 *Aida sedang menjalankan tugas...* (%s)", durStr))
+	}
+	return fmt.Sprintf("🌸 *Aida sedang menjalankan tugas...* (%s)\n\n%s", durStr, base)
+}
+
 func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preloadSkills string, partsCount int) {
 	lockIface, _ := s.userLocks.LoadOrStore(userID, &sync.Mutex{})
 	lock := lockIface.(*sync.Mutex)
@@ -899,7 +919,7 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 	hasStatusMsg := false
 
 	if partsCount > 1 {
-		statusText := fmt.Sprintf("🌸 *Aida sedang menjalankan tugas...*\n_📦 Menggabungkan %d potongan pesan menjadi 1 prompt utuh (%d karakter)_\n\n💭 _Sedang menganalisis instruksi..._", partsCount, len([]rune(prompt)))
+		statusText := fmt.Sprintf("🌸 *Aida sedang menjalankan tugas...* (0s)\n_📦 Menggabungkan %d potongan pesan menjadi 1 prompt utuh (%d karakter)_\n\n💭 _Sedang menganalisis instruksi..._", partsCount, len([]rune(prompt)))
 		msg, err := SendSafeMessage(s.bot, chatID, statusText, cancelKb)
 		if err == nil {
 			statusMsg = msg
@@ -907,7 +927,7 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 			s.sessMgr.AddTelegramMsgID(userID, statusMsg.MessageID)
 		}
 	} else {
-		statusText := "🌸 *Aida sedang menjalankan tugas...*\n\n💭 _Sedang berpikir & menganalisis instruksi..._"
+		statusText := "🌸 *Aida sedang menjalankan tugas...* (0s)\n\n💭 _Sedang berpikir & menganalisis instruksi..._"
 		msg, err := SendSafeMessage(s.bot, chatID, statusText, cancelKb)
 		if err == nil {
 			statusMsg = msg
@@ -921,7 +941,7 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 		startTime := time.Now()
 
 		if attempt > 0 {
-			recoveryNotice := fmt.Sprintf("⚠️ *Deteksi Terhenti / Stuck — Auto-Recovery Berjalan...*\n\n_Melanjutkan pekerjaan di sesi `%s` dan menyiapkan laporan progress..._", userSess.CurrentSessionID)
+			recoveryNotice := fmt.Sprintf("⚠️ *Auto-Recovery Berjalan...* (0s)\n\n_Melanjutkan pekerjaan di sesi `%s` dan menyiapkan laporan progress..._", userSess.CurrentSessionID)
 			if hasStatusMsg {
 				_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, recoveryNotice, &cancelKb)
 			} else {
@@ -954,9 +974,9 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 
 		// Heartbeat + self-restart approval state (per-task, guarded by mutex).
 		var progMu sync.Mutex
-		lastDisplay := "🌸 *Aida sedang menjalankan tugas...*\n\n💭 _Sedang berpikir & menganalisis instruksi..._"
+		lastDisplay := "🌸 *Aida sedang menjalankan tugas...* (0s)\n\n💭 _Sedang berpikir & menganalisis instruksi..._"
 		if attempt > 0 {
-			lastDisplay = "⚠️ *Auto-Recovery Berjalan...*\n\n💭 _Menganalisis status dan melanjutkan pekerjaan..._"
+			lastDisplay = "⚠️ *Auto-Recovery Berjalan...* (0s)\n\n💭 _Menganalisis status dan melanjutkan pekerjaan..._"
 		}
 		lastUpdate := time.Now()
 		approvalCardSent := false
@@ -972,6 +992,8 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 			WorkingDir:        s.cfg.Hermes.WorkingDir,
 			Timeout:           hardTimeout,
 			InactivityTimeout: inactTimeout,
+			StartTime:         startTime,
+			IsRecovery:        (attempt > 0),
 			OnProgress: func(displayText string) {
 				progMu.Lock()
 				lastDisplay = displayText
@@ -992,9 +1014,9 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 			},
 		}
 
-		// Heartbeat: keep editing the status message with elapsed time so it never looks stuck/dead.
+		// Heartbeat: update elapsed time in the header so the user sees live progress without bottom clutter
 		go func() {
-			ticker := time.NewTicker(12 * time.Second)
+			ticker := time.NewTicker(4 * time.Second)
 			defer ticker.Stop()
 			for {
 				select {
@@ -1005,12 +1027,12 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 					stale := time.Since(lastUpdate)
 					base := lastDisplay
 					progMu.Unlock()
-					if stale < 12*time.Second || !hasStatusMsg {
+					if stale < 3*time.Second || !hasStatusMsg {
 						continue
 					}
 					elapsed := time.Since(startTime).Round(time.Second)
-					hb := fmt.Sprintf("%s\n\n⏳ _Masih berjalan... (%s) — Aida aktif bekerja..._\n_Gunakan /stop untuk batalkan._", base, elapsed)
-					_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, hb, &cancelKb)
+					updated := updateHeaderElapsed(base, elapsed, attempt > 0)
+					_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, updated, &cancelKb)
 				}
 			}
 		}()

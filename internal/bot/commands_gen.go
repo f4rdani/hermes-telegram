@@ -7,6 +7,7 @@ var HermesMenuCommands = []tgbotapi.BotCommand{
 	{Command: "help", Description: "Show available commands (/help skills lists skill commands, /help <text> filters)"},
 	{Command: "new", Description: "Start a new session (fresh session ID + history)"},
 	{Command: "stop", Description: "Kill all running background processes"},
+	{Command: "ps", Description: "Show running background processes, CPU/RAM, and render tasks"},
 	{Command: "status", Description: "Show session, model, token, and context info"},
 	{Command: "egress", Description: "Show Docker egress proxy status"},
 	{Command: "resume", Description: "Resume a previously-named session"},

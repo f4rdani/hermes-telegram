@@ -1124,17 +1124,125 @@ func (h *CommandHandler) HandleAgents(bot *tgbotapi.BotAPI, chatID, userID int64
 		busyState = "🟢 Sedang Mengeksekusi Tugas"
 	}
 
+	bgStatus := "Tidak ada proses render/task aktif"
+	if out, err := exec.Command("pgrep", "-c", "ffmpeg").Output(); err == nil && strings.TrimSpace(string(out)) != "0" {
+		bgStatus = "🎬 *ffmpeg sedang merender video di latar belakang!*"
+	}
+
 	reply := fmt.Sprintf(
 		"🤖 *Status Agen & Tugas Berjalan*\n\n"+
 			"• *Agen Utama:* Hermes Agent (`%s`)\n"+
 			"• *Status Eksekusi:* %s\n"+
 			"• *Mode Busy:* `%s`\n"+
 			"• *Sesi Aktif:* `%s`\n\n"+
-			"_Gunakan `/queue` untuk melihat antrean atau `/stop` untuk membatalkan._",
-		s.CurrentModel, busyState, s.BusyMode, s.CurrentSessionID,
+			"⚙️ *Proses Latar Belakang:* %s\n\n"+
+			"_Gunakan `/ps` untuk rincian proses CPU/RAM, `/queue` untuk antrean, atau `/stop` untuk membatalkan._",
+		s.CurrentModel, busyState, s.BusyMode, s.CurrentSessionID, bgStatus,
 	)
 	dismissKb := DismissKeyboard()
 	_, _ = SendSafeMessage(bot, chatID, reply, dismissKb)
+}
+
+func (h *CommandHandler) HandleProcessStatus(bot *tgbotapi.BotAPI, chatID int64) {
+	var sb strings.Builder
+	sb.WriteString("⚙️ *Daftar Proses & Task Latar Belakang*\n\n")
+
+	// 1. Hermes registered background tasks (~/.hermes/processes.json)
+	hermesProcessesPath := filepath.Join(h.cfg.Hermes.HermesHome, "processes.json")
+	hasHermesBg := false
+	if data, err := os.ReadFile(hermesProcessesPath); err == nil && len(data) > 0 {
+		var procEntries []map[string]interface{}
+		if err := json.Unmarshal(data, &procEntries); err == nil && len(procEntries) > 0 {
+			sb.WriteString("🤖 *Hermes Background Tasks:*\n")
+			for _, p := range procEntries {
+				sessID, _ := p["session_id"].(string)
+				cmd, _ := p["command"].(string)
+				pidVal := p["pid"]
+				sb.WriteString(fmt.Sprintf("• `%s` (PID %v):\n  `%s`\n", sessID, pidVal, truncate(cmd, 60)))
+				hasHermesBg = true
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	// 2. Query system processes: ps -eo pid,%cpu,%mem,etime,comm,args --sort=-%cpu
+	out, err := exec.Command("ps", "-eo", "pid,%cpu,%mem,etime,comm,args", "--sort=-%cpu").Output()
+	hasSystemTask := false
+	if err == nil {
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		var taskLines []string
+		if len(lines) > 1 {
+			for _, line := range lines[1:] {
+				fields := strings.Fields(line)
+				if len(fields) < 6 {
+					continue
+				}
+				pid := fields[0]
+				cpu := fields[1]
+				mem := fields[2]
+				etime := fields[3]
+				comm := fields[4]
+				args := strings.Join(fields[5:], " ")
+
+				cpuFloat, _ := strconv.ParseFloat(cpu, 64)
+				memFloat, _ := strconv.ParseFloat(mem, 64)
+				lowComm := strings.ToLower(comm)
+				lowArgs := strings.ToLower(args)
+
+				isHeavy := false
+				if strings.Contains(lowComm, "ffmpeg") || strings.Contains(lowArgs, "ffmpeg") ||
+					strings.Contains(lowComm, "yt-dlp") || strings.Contains(lowArgs, "yt-dlp") ||
+					strings.Contains(lowComm, "whisper") || strings.Contains(lowArgs, "whisper") ||
+					(strings.Contains(lowComm, "python") && (strings.Contains(lowArgs, "omw") || strings.Contains(lowArgs, "render") || cpuFloat > 3.0)) ||
+					(cpuFloat >= 8.0 || (cpuFloat >= 2.0 && memFloat >= 3.0)) {
+					isHeavy = true
+				}
+
+				if isHeavy {
+					desc := comm
+					if strings.Contains(lowComm, "ffmpeg") || strings.Contains(lowArgs, "ffmpeg") {
+						desc = "🎬 *ffmpeg (Render/Transcode)*"
+					} else if strings.Contains(lowArgs, "hermes") {
+						desc = "🤖 *Hermes Engine*"
+					} else if strings.Contains(lowArgs, "agy") {
+						desc = "🪐 *Antigravity Engine*"
+					}
+					taskLines = append(taskLines, fmt.Sprintf(
+						"• %s `(PID %s)`\n  CPU: `%s%%` | RAM: `%s%%` | Durasi: `%s`\n  `%s`",
+						desc, pid, cpu, mem, etime, truncate(args, 70),
+					))
+				}
+			}
+		}
+
+		if len(taskLines) > 0 {
+			hasSystemTask = true
+			sb.WriteString("🖥️ *Proses Task / Render Aktif di VPS:*\n")
+			for _, tl := range taskLines {
+				sb.WriteString(tl + "\n\n")
+			}
+		}
+	}
+
+	if !hasHermesBg && !hasSystemTask {
+		sb.WriteString("✅ *Tidak ada proses render atau task berat di latar belakang.*\n")
+		sb.WriteString("_Sistem dalam keadaan idle dan siap menerima instruksi baru._\n\n")
+	}
+
+	// Add summary RAM info
+	memOut, _ := exec.Command("free", "-h").Output()
+	if len(memOut) > 0 {
+		lines := strings.Split(strings.TrimSpace(string(memOut)), "\n")
+		if len(lines) >= 2 {
+			f := strings.Fields(lines[1])
+			if len(f) >= 7 {
+				sb.WriteString(fmt.Sprintf("📊 *Memori Server:* %s terpakai / %s (Tersedia: %s)\n", f[2], f[1], f[6]))
+			}
+		}
+	}
+
+	dismissKb := DismissKeyboard()
+	_, _ = SendSafeMessage(bot, chatID, sb.String(), dismissKb)
 }
 
 func (h *CommandHandler) HandleMemory(bot *tgbotapi.BotAPI, chatID int64, arg string) {

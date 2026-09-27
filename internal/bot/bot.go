@@ -344,6 +344,8 @@ func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
 	case "/stop":
 		s.aggregator.Cancel(userID)
 		s.cmdHandler.HandleStop(s.bot, chatID, userID)
+	case "/ps", "/processes", "/procs":
+		s.cmdHandler.HandleProcessStatus(s.bot, chatID)
 	case "/logs":
 		s.cmdHandler.HandleLogs(s.bot, chatID)
 	case "/retry":

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -881,7 +882,27 @@ func (h *CommandHandler) HandleSendFile(bot *tgbotapi.BotAPI, chatID, userID int
 	}
 
 	fileName := filepath.Base(filePath)
-	if isImageFile(filePath) {
+	switch {
+	case isVideoFile(filePath):
+		vid := tgbotapi.NewVideo(chatID, tgbotapi.FilePath(filePath))
+		vid.Caption = fmt.Sprintf("🎬 %s", fileName)
+		sent, err := bot.Send(vid)
+		if err != nil {
+			log.Printf("[bot] Failed to send video (%s), falling back to document: %v", filePath, err)
+			doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(filePath))
+			doc.Caption = fmt.Sprintf("📎 %s", fileName)
+			sentDoc, errDoc := bot.Send(doc)
+			if errDoc != nil {
+				reply := fmt.Sprintf("❌ Gagal mengirim file: %v", errDoc)
+				sMsg, _ := SendSafeMessage(bot, chatID, reply, nil)
+				h.sessMgr.AddTelegramMsgID(userID, sMsg.MessageID)
+				return
+			}
+			h.sessMgr.AddTelegramMsgID(userID, sentDoc.MessageID)
+			return
+		}
+		h.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+	case isImageFile(filePath):
 		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FilePath(filePath))
 		photo.Caption = fmt.Sprintf("🖼️ %s", fileName)
 		sent, err := bot.Send(photo)
@@ -892,7 +913,7 @@ func (h *CommandHandler) HandleSendFile(bot *tgbotapi.BotAPI, chatID, userID int
 			return
 		}
 		h.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
-	} else {
+	default:
 		doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(filePath))
 		doc.Caption = fmt.Sprintf("📎 %s", fileName)
 		sent, err := bot.Send(doc)

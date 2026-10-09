@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -20,43 +21,47 @@ type UserBuffer struct {
 	mu        sync.Mutex
 	chatID    int64
 	userID    int64
+	threadID  int
 	chunks    []MessageChunk
 	timer     *time.Timer
-	executeFn func(chatID, userID int64, prompt, imagePath, preloadSkills string, partsCount int)
+	executeFn func(chatID, userID int64, threadID int, prompt, imagePath, preloadSkills string, partsCount int)
 }
 
 // MessageAggregator manages per-user buffers to reassemble messages split by Telegram's 4096-char limit.
 type MessageAggregator struct {
 	mu      sync.Mutex
-	buffers map[int64]*UserBuffer
+	buffers map[string]*UserBuffer
 }
 
 // NewMessageAggregator initializes a thread-safe MessageAggregator.
 func NewMessageAggregator() *MessageAggregator {
 	return &MessageAggregator{
-		buffers: make(map[int64]*UserBuffer),
+		buffers: make(map[string]*UserBuffer),
 	}
 }
 
 // Add appends an incoming message to the user's aggregation buffer.
 func (a *MessageAggregator) Add(
 	msg *tgbotapi.Message,
-	executeFn func(chatID, userID int64, prompt, imagePath, preloadSkills string, partsCount int),
+	threadID int,
+	executeFn func(chatID, userID int64, threadID int, prompt, imagePath, preloadSkills string, partsCount int),
 ) {
 	userID := msg.From.ID
 	chatID := msg.Chat.ID
 	text := msg.Text
+	key := fmt.Sprintf("%d:%d", userID, threadID)
 
 	a.mu.Lock()
-	buf, exists := a.buffers[userID]
+	buf, exists := a.buffers[key]
 	if !exists {
 		buf = &UserBuffer{
 			chatID:    chatID,
 			userID:    userID,
+			threadID:  threadID,
 			chunks:    make([]MessageChunk, 0, 4),
 			executeFn: executeFn,
 		}
-		a.buffers[userID] = buf
+		a.buffers[key] = buf
 	}
 	a.mu.Unlock()
 
@@ -81,39 +86,34 @@ func (a *MessageAggregator) Add(
 	}
 
 	buf.timer = time.AfterFunc(delay, func() {
-		a.flush(userID)
+		a.flush(key)
 	})
 }
 
 // Cancel terminates and discards any pending aggregation buffer for a user (e.g. on /stop).
 func (a *MessageAggregator) Cancel(userID int64) bool {
 	a.mu.Lock()
-	buf, exists := a.buffers[userID]
-	if exists {
-		delete(a.buffers, userID)
+	var keysToCancel []string
+	prefix := fmt.Sprintf("%d:", userID)
+	for k := range a.buffers {
+		if strings.HasPrefix(k, prefix) {
+			keysToCancel = append(keysToCancel, k)
+		}
+	}
+	for _, k := range keysToCancel {
+		delete(a.buffers, k)
 	}
 	a.mu.Unlock()
 
-	if !exists || buf == nil {
-		return false
-	}
-
-	buf.mu.Lock()
-	defer buf.mu.Unlock()
-	if buf.timer != nil {
-		buf.timer.Stop()
-		buf.timer = nil
-	}
-	buf.chunks = nil
-	return true
+	return len(keysToCancel) > 0
 }
 
 // flush combines all accumulated chunks and sends them to the execution function.
-func (a *MessageAggregator) flush(userID int64) {
+func (a *MessageAggregator) flush(key string) {
 	a.mu.Lock()
-	buf, exists := a.buffers[userID]
+	buf, exists := a.buffers[key]
 	if exists {
-		delete(a.buffers, userID)
+		delete(a.buffers, key)
 	}
 	a.mu.Unlock()
 
@@ -125,6 +125,8 @@ func (a *MessageAggregator) flush(userID int64) {
 	chunks := buf.chunks
 	buf.chunks = nil
 	chatID := buf.chatID
+	userID := buf.userID
+	threadID := buf.threadID
 	exec := buf.executeFn
 	buf.mu.Unlock()
 
@@ -136,12 +138,12 @@ func (a *MessageAggregator) flush(userID int64) {
 	partsCount := len(chunks)
 
 	if partsCount > 1 {
-		log.Printf("[aggregator] Successfully merged %d split Telegram messages into 1 complete prompt (%d chars) for User %d",
-			partsCount, len([]rune(combinedPrompt)), userID)
+		log.Printf("[aggregator] Successfully merged %d split Telegram messages into 1 complete prompt (%d chars) for User %d (Thread %d)",
+			partsCount, len([]rune(combinedPrompt)), userID, threadID)
 	}
 
 	if exec != nil {
-		exec(chatID, userID, combinedPrompt, "", "", partsCount)
+		exec(chatID, userID, threadID, combinedPrompt, "", "", partsCount)
 	}
 }
 

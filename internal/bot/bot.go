@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -22,10 +23,29 @@ import (
 type QueuedTask struct {
 	ChatID        int64
 	UserID        int64
+	ThreadID      int
+	ReplyToMsgID  int
 	Prompt        string
 	ImagePath     string
 	PreloadSkills string
 	EnqueuedAt    time.Time
+}
+
+type CustomForumTopicCreated struct {
+	Name              string `json:"name"`
+	IconColor         int    `json:"icon_color"`
+	IconCustomEmojiID string `json:"icon_custom_emoji_id"`
+}
+
+type CustomMessageInfo struct {
+	MessageThreadID   int                      `json:"message_thread_id"`
+	IsTopicMessage    bool                     `json:"is_topic_message"`
+	ForumTopicCreated *CustomForumTopicCreated `json:"forum_topic_created"`
+}
+
+type CustomUpdateInfo struct {
+	UpdateID int                `json:"update_id"`
+	Message  *CustomMessageInfo `json:"message"`
 }
 
 type BotServer struct {
@@ -227,19 +247,43 @@ func (s *BotServer) Start(ctx context.Context) error {
 
 	go s.CheckAndNotifyRestart()
 
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-
-	updates := s.bot.GetUpdatesChan(u)
-
+	offset := 0
 	for {
 		select {
 		case <-ctx.Done():
 			log.Println("[bot] Shutting down Telegram bot cleanly...")
 			return nil
-		case update, ok := <-updates:
-			if !ok {
+		default:
+		}
+
+		params := tgbotapi.Params{
+			"offset":  strconv.Itoa(offset),
+			"timeout": "60",
+		}
+
+		resp, err := s.bot.MakeRequest("getUpdates", params)
+		if err != nil {
+			if ctx.Err() != nil {
 				return nil
+			}
+			log.Printf("[bot] getUpdates error: %v. Retrying in 3s...", err)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		var updates []tgbotapi.Update
+		if err := json.Unmarshal(resp.Result, &updates); err != nil {
+			log.Printf("[bot] Failed to unmarshal updates: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		var customUpdates []CustomUpdateInfo
+		_ = json.Unmarshal(resp.Result, &customUpdates)
+
+		for i, update := range updates {
+			if update.UpdateID >= offset {
+				offset = update.UpdateID + 1
 			}
 
 			if update.CallbackQuery != nil {
@@ -248,7 +292,13 @@ func (s *BotServer) Start(ctx context.Context) error {
 			}
 
 			if update.Message != nil {
-				go s.handleMessage(update.Message)
+				threadID := 0
+				var topicCreated *CustomForumTopicCreated
+				if i < len(customUpdates) && customUpdates[i].Message != nil {
+					threadID = customUpdates[i].Message.MessageThreadID
+					topicCreated = customUpdates[i].Message.ForumTopicCreated
+				}
+				go s.handleMessage(update.Message, threadID, topicCreated)
 			}
 		}
 	}
@@ -331,20 +381,40 @@ func (s *BotServer) handleCallbackQuery(cb *tgbotapi.CallbackQuery) {
 	}
 }
 
-func (s *BotServer) handleMessage(msg *tgbotapi.Message) {
+func (s *BotServer) handleMessage(msg *tgbotapi.Message, threadID int, topicCreated *CustomForumTopicCreated) {
 	userID := msg.From.ID
 	chatID := msg.Chat.ID
 	text := strings.TrimSpace(msg.Text)
 
+	// Auto-detect topic creation
+	if topicCreated != nil {
+		name := topicCreated.Name
+		lower := strings.ToLower(name)
+		userSess := s.sessMgr.Get(userID, chatID, threadID)
+		if strings.Contains(lower, "cyber") || strings.Contains(lower, "hack") || strings.Contains(lower, "pentest") || strings.Contains(lower, "sec") {
+			userSess.Persona = "cyber"
+			userSess.YoloMode = true
+			s.sessMgr.Save()
+			welcome := fmt.Sprintf("🛡️ *Topik Terdeteksi:* `%s`\nTopik ini otomatis dihubungkan ke karakter: **Cyber Security (Godmode Aktif)**!\nSiap menerima tugas keamanan siber, audit celah, dan exploit analysis.", name)
+			_, _ = SendSafeMessage(s.bot, chatID, welcome, nil, threadID)
+		} else if strings.Contains(lower, "konten") || strings.Contains(lower, "content") || strings.Contains(lower, "lirik") || strings.Contains(lower, "musik") || strings.Contains(lower, "video") || strings.Contains(lower, "media") {
+			userSess.Persona = "konten"
+			userSess.YoloMode = true
+			s.sessMgr.Save()
+			welcome := fmt.Sprintf("🎬 *Topik Terdeteksi:* `%s`\nTopik ini otomatis dihubungkan ke karakter: **Aida Konten**!\nSiap membantu pembuatan lirik lagu, riset konsep video, dan pengolahan media.", name)
+			_, _ = SendSafeMessage(s.bot, chatID, welcome, nil, threadID)
+		}
+	}
+
 	if !s.cfg.IsAllowed(userID) {
 		log.Printf("[bot] Access denied for UserID %d in ChatID %d", userID, chatID)
-		_, _ = SendSafeMessage(s.bot, chatID, "⛔ *Akses Ditolak*\n\nUser ID Anda belum diizinkan dalam konfigurasi.", nil)
+		_, _ = SendSafeMessage(s.bot, chatID, fmt.Sprintf("⛔ *Akses Ditolak*\n\nUser ID Anda (`%d`) belum diizinkan dalam konfigurasi.", userID), nil, threadID)
 		return
 	}
 
 	// Global pause (/pause): hold all new work except /pause itself.
 	if s.isPaused() && !isPauseCommand(text) {
-		sent, _ := SendSafeMessage(s.bot, chatID, "⏸️ *Gateway Dijeda.*\nPesan/media diabaikan. Gunakan `/pause off` untuk melanjutkan.", nil)
+		sent, _ := SendSafeMessage(s.bot, chatID, "⏸️ *Gateway Dijeda.*\nPesan/media diabaikan. Gunakan `/pause off` untuk melanjutkan.", nil, threadID)
 		s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 		return
 	}
@@ -357,11 +427,11 @@ func (s *BotServer) handleMessage(msg *tgbotapi.Message) {
 	if hasMedia {
 		prompt, imagePath, err := ProcessMediaMessage(s.bot, msg, s.cfg.Hermes.MediaDir)
 		if err != nil {
-			sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("❌ Gagal memproses media: %v", err), nil)
+			sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("❌ Gagal memproses media: %v", err), nil, threadID)
 			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 			return
 		}
-		s.executeTask(chatID, userID, prompt, imagePath, "", 1)
+		s.executeTask(chatID, userID, threadID, msg.MessageID, prompt, imagePath, "", 1)
 		return
 	}
 
@@ -372,19 +442,20 @@ func (s *BotServer) handleMessage(msg *tgbotapi.Message) {
 	// 2. Handle slash commands
 	if strings.HasPrefix(text, "/") {
 		s.aggregator.Cancel(userID)
-		s.dispatchCommand(msg, text)
+		s.dispatchCommand(msg, threadID, text)
 		return
 	}
 
 	// 3. Regular chat prompt execution via MessageAggregator (auto-stitches Telegram 4096-char split chunks)
-	s.aggregator.Add(msg, func(cID, uID int64, prompt, img, skills string, partsCount int) {
-		s.executeTask(cID, uID, prompt, img, skills, partsCount)
+	s.aggregator.Add(msg, threadID, func(cID, uID int64, tID int, prompt, img, skills string, partsCount int) {
+		s.executeTask(cID, uID, tID, msg.MessageID, prompt, img, skills, partsCount)
 	})
 }
 
-func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
+func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, threadID int, rawText string) {
 	chatID := msg.Chat.ID
 	userID := msg.From.ID
+	replyToMsgID := msg.MessageID
 
 	parts := strings.SplitN(rawText, " ", 2)
 	cmd := strings.ToLower(parts[0])
@@ -450,7 +521,7 @@ func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
 	case "/reload_skills":
 		s.cmdHandler.HandleSkills(s.bot, chatID)
 	case "/reload_mcp":
-		sent, _ := SendSafeMessage(s.bot, chatID, "🔄 Konfigurasi MCP Server berhasil dimuat ulang.", nil)
+		sent, _ := SendSafeMessage(s.bot, chatID, "🔄 Konfigurasi MCP Server berhasil dimuat ulang.", nil, threadID)
 		s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 	case "/whoami":
 		s.cmdHandler.HandleWhoAmI(s.bot, chatID, userID, msg.From)
@@ -463,18 +534,23 @@ func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
 		s.takePendingSteer(userID)
 		s.withdrawSelfRestartApproval(userID, "Tugas dibatalkan via /stop — perintah TIDAK dijalankan.")
 		if n := s.stopUserBackgroundTasks(userID); n > 0 {
-			sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("🛑 *%d background task ikut dibatalkan.*", n), nil)
+			sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("🛑 *%d background task ikut dibatalkan.*", n), nil, threadID)
 			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 		}
+		if threadID > 0 {
+			topicKey := fmt.Sprintf("topic:%d:%d", chatID, threadID)
+			s.runner.StopKey(topicKey)
+		}
+		s.runner.Stop(userID)
 		s.cmdHandler.HandleStop(s.bot, chatID, userID)
 	case "/ps", "/processes", "/procs":
 		s.cmdHandler.HandleProcessStatus(s.bot, chatID)
 	case "/logs":
 		s.cmdHandler.HandleLogs(s.bot, chatID)
 	case "/retry":
-		s.handleRetryCommand(chatID, userID, arg)
+		s.handleRetryCommand(chatID, userID, threadID, replyToMsgID, arg)
 	case "/undo":
-		s.handleUndoCommand(chatID, userID)
+		s.handleUndoCommand(chatID, userID, threadID)
 	case "/egress":
 		s.cmdHandler.HandleEgress(s.bot, chatID)
 	case "/debug":
@@ -519,6 +595,8 @@ func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
 		s.cmdHandler.HandleVoice(s.bot, chatID, arg)
 	case "/personality":
 		s.cmdHandler.HandlePersonality(s.bot, chatID, arg)
+	case "/role", "/persona":
+		s.handleRoleCommand(msg, threadID, arg)
 	case "/fast":
 		s.cmdHandler.HandleFast(s.bot, chatID, arg)
 	case "/approvals":
@@ -539,7 +617,7 @@ func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
 		s.cmdHandler.HandleFooter(s.bot, chatID, arg)
 	case "/suggestions", "/suggest":
 		s.cmdHandler.HandleSuggestions(s.bot, chatID, arg)
-	case "/blueprint", "/bp":
+	case "/blueprint":
 		s.cmdHandler.HandleBlueprint(s.bot, chatID, arg)
 	case "/login":
 		s.cmdHandler.HandleLogin(s.bot, chatID)
@@ -551,81 +629,81 @@ func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, rawText string) {
 		s.cmdHandler.HandleLoop(s.bot, chatID, arg)
 	case "/goal":
 		if arg == "" {
-			sent, _ := SendSafeMessage(s.bot, chatID, "🎯 *Target Goal Hermes:*\n\nFormat penggunaan: `/goal <deskripsi target>`\nHermes akan bekerja secara persisten melintasi turn sampai target tercapai.", nil)
+			sent, _ := SendSafeMessage(s.bot, chatID, "🎯 *Target Goal Hermes:*\n\nFormat penggunaan: `/goal <deskripsi target>`\nHermes akan bekerja secara persisten melintasi turn sampai target tercapai.", nil, threadID)
 			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 			return
 		}
-		s.executeTask(chatID, userID, fmt.Sprintf("Target Goal: %s\nKerjakan secara bertahap sampai tujuan ini tercapai.", arg), "", "", 1)
+		s.executeTask(chatID, userID, threadID, replyToMsgID, fmt.Sprintf("Target Goal: %s\nKerjakan secara bertahap sampai tujuan ini tercapai.", arg), "", "", 1)
 	case "/plan":
 		if arg == "" {
-			sent, _ := SendSafeMessage(s.bot, chatID, "📝 *Perencanaan Implementasi (Plan):*\n\nFormat: `/plan <tugas atau fitur>`\nHermes akan menyusun rencana implementasi markdown terperinci tanpa mengeksekusi aksi berbahaya.", nil)
+			sent, _ := SendSafeMessage(s.bot, chatID, "📝 *Perencanaan Implementasi (Plan):*\n\nFormat: `/plan <tugas atau fitur>`\nHermes akan menyusun rencana implementasi markdown terperinci tanpa mengeksekusi aksi berbahaya.", nil, threadID)
 			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 			return
 		}
-		s.executeTask(chatID, userID, fmt.Sprintf("Buatkan rencana implementasi (architecture & action plan) lengkap dalam markdown untuk: %s\nJangan langsung eksekusi atau merubah file, fokus pada analisa dan rencana tindakan.", arg), "", "", 1)
+		s.executeTask(chatID, userID, threadID, replyToMsgID, fmt.Sprintf("Buatkan rencana implementasi (architecture & action plan) lengkap dalam markdown untuk: %s\nJangan langsung eksekusi atau merubah file, fokus pada analisa dan rencana tindakan.", arg), "", "", 1)
 	case "/review":
 		prompt := "Tinjau (review) pekerjaan dan kode yang telah dikerjakan di sesi ini secara kritis. Berikan catatan kualitas, temuan bug, dan rekomendasi penyempurnaan."
 		if arg != "" {
 			prompt = fmt.Sprintf("Tinjau (review) hal berikut: %s\nFokus pada kebenaran arsitektur, keamanan, dan efisiensi.", arg)
 		}
-		s.executeTask(chatID, userID, prompt, "", "", 1)
+		s.executeTask(chatID, userID, threadID, replyToMsgID, prompt, "", "", 1)
 	case "/refine":
 		prompt := "Tinjau percakapan sesi ini dan simpan pelajaran atau wawasan penting ke memori."
 		if arg != "" {
 			prompt += fmt.Sprintf(" Fokus: %s", arg)
 		}
-		s.executeTask(chatID, userID, prompt, "", "", 1)
+		s.executeTask(chatID, userID, threadID, replyToMsgID, prompt, "", "", 1)
 	case "/moa":
 		if arg == "" {
-			sent, _ := SendSafeMessage(s.bot, chatID, "🧬 *Mixture of Agents (MoA):*\n\nFormat: `/moa <prompt>`\nMenjalankan satu prompt melalui perpaduan model.", nil)
+			sent, _ := SendSafeMessage(s.bot, chatID, "🧬 *Mixture of Agents (MoA):*\n\nFormat: `/moa <prompt>`\nMenjalankan satu prompt melalui perpaduan model.", nil, threadID)
 			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 			return
 		}
-		s.executeTask(chatID, userID, arg, "", "", 1)
+		s.executeTask(chatID, userID, threadID, replyToMsgID, arg, "", "", 1)
 	case "/subgoal":
 		if arg == "" {
-			sent, _ := SendSafeMessage(s.bot, chatID, "🎯 *Kriteria Subgoal:*\n\nFormat: `/subgoal <kriteria tambahan pada goal>`", nil)
+			sent, _ := SendSafeMessage(s.bot, chatID, "🎯 *Kriteria Subgoal:*\n\nFormat: `/subgoal <kriteria tambahan pada goal>`", nil, threadID)
 			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 			return
 		}
-		s.executeTask(chatID, userID, fmt.Sprintf("Tambahkan kriteria subgoal berikut: %s", arg), "", "", 1)
+		s.executeTask(chatID, userID, threadID, replyToMsgID, fmt.Sprintf("Tambahkan kriteria subgoal berikut: %s", arg), "", "", 1)
 	case "/learn":
 		if arg == "" {
-			sent, _ := SendSafeMessage(s.bot, chatID, "🎓 *Hermes Skill Learning:*\n\nFormat: `/learn <hal atau dokumentasi yang ingin dipelajari>`\nHermes akan membuat skill reusable baru di ~/.hermes/skills/", nil)
+			sent, _ := SendSafeMessage(s.bot, chatID, "🎓 *Hermes Skill Learning:*\n\nFormat: `/learn <hal atau dokumentasi yang ingin dipelajari>`\nHermes akan membuat skill reusable baru di ~/.hermes/skills/", nil, threadID)
 			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 			return
 		}
-		s.executeTask(chatID, userID, fmt.Sprintf("Pelajari dan buat skill reusable baru untuk: %s\nSimpan dokumen SKILL.md ke ~/.hermes/skills/", arg), "", "", 1)
+		s.executeTask(chatID, userID, threadID, replyToMsgID, fmt.Sprintf("Pelajari dan buat skill reusable baru untuk: %s\nSimpan dokumen SKILL.md ke ~/.hermes/skills/", arg), "", "", 1)
 	case "/init":
 		prompt := "Pindai repositori proyek ini dan perbarui atau buat file AGENTS.md dengan panduan instruksi proyek yang lengkap."
 		if arg != "" {
 			prompt += fmt.Sprintf(" Catatan tambahan: %s", arg)
 		}
-		s.executeTask(chatID, userID, prompt, "", "", 1)
+		s.executeTask(chatID, userID, threadID, replyToMsgID, prompt, "", "", 1)
 	case "/bg":
 		s.handleBgCommand(chatID, userID, arg)
 	case "/btw":
 		if arg == "" {
-			sent, _ := SendSafeMessage(s.bot, chatID, "💬 *Pertanyaan Sampingan (By The Way):*\n\nFormat: `/btw <pertanyaan singkat>`\nMenanyakan pertanyaan sampingan tanpa merusak alur fokus.", nil)
+			sent, _ := SendSafeMessage(s.bot, chatID, "💬 *Pertanyaan Sampingan (By The Way):*\n\nFormat: `/btw <pertanyaan singkat>`\nMenanyakan pertanyaan sampingan tanpa merusak alur fokus.", nil, threadID)
 			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 			return
 		}
-		s.executeTask(chatID, userID, fmt.Sprintf("[Pertanyaan Sampingan (BTW)]: %s", arg), "", "", 1)
+		s.executeTask(chatID, userID, threadID, replyToMsgID, fmt.Sprintf("[Pertanyaan Sampingan (BTW)]: %s", arg), "", "", 1)
 	case "/steer":
 		s.handleSteerCommand(chatID, userID, arg)
 	default:
 		skillName := strings.TrimPrefix(cmd, "/")
 		skillsDir := filepath.Join(s.cfg.Hermes.HermesHome, "skills")
 		if !skillExists(skillsDir, skillName) {
-			sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("❓ Perintah `/%s` tidak dikenali.\n\nKetik `/help` atau `/commands` untuk melihat daftar perintah yang tersedia.", skillName), nil)
+			sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("❓ Perintah `/%s` tidak dikenali.\n\nKetik `/help` atau `/commands` untuk melihat daftar perintah yang tersedia.", skillName), nil, threadID)
 			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 			return
 		}
 
 		if arg != "" {
-			s.executeTask(chatID, userID, arg, "", skillName, 1)
+			s.executeTask(chatID, userID, threadID, replyToMsgID, arg, "", skillName, 1)
 		} else {
-			s.executeTask(chatID, userID, fmt.Sprintf("Gunakan skill %s untuk membantu tugas berikutnya.", skillName), "", skillName, 1)
+			s.executeTask(chatID, userID, threadID, replyToMsgID, fmt.Sprintf("Gunakan skill %s untuk membantu tugas berikutnya.", skillName), "", skillName, 1)
 		}
 	}
 }
@@ -766,17 +844,69 @@ func (s *BotServer) handleCleanCommand(chatID, userID int64) {
 	}(chatID, ids)
 }
 
-func (s *BotServer) handleRetryCommand(chatID, userID int64, arg string) {
+func (s *BotServer) handleRoleCommand(msg *tgbotapi.Message, threadID int, arg string) {
+	chatID := msg.Chat.ID
+	userID := msg.From.ID
+
+	userSess := s.sessMgr.Get(userID, chatID, threadID)
+	target := strings.ToLower(strings.TrimSpace(arg))
+
+	if target == "" {
+		curRole := "🌸 *Aida (Core / General Assistant)*"
+		if userSess.Persona == "cyber" {
+			curRole = "🛡️ *Cyber Security (Godmode Aktif)*"
+		} else if userSess.Persona == "konten" {
+			curRole = "🎬 *Aida Konten (Creative Director & Media)*"
+		}
+
+		reply := fmt.Sprintf("🎭 *Karakter & Soul Bot Saat Ini:*\n%s\n\n"+
+			"Gunakan perintah berikut untuk mengubah karakter di topik/sesi ini:\n"+
+			"• `/role cyber` — 🛡️ Keamanan siber, ethical hacking, exploit analysis & *Godmode Aktif*.\n"+
+			"• `/role konten` — 🎬 Pembuatan lirik musik, ide konten, riset footage, dan editing FFmpeg.\n"+
+			"• `/role aida` — 🌸 Asisten umum serbaguna, coding, dan Hermes core.\n",
+			curRole)
+		_, _ = SendSafeMessage(s.bot, chatID, reply, nil, threadID)
+		return
+	}
+
+	switch {
+	case strings.Contains(target, "cyber") || strings.Contains(target, "hack") || strings.Contains(target, "pentest") || strings.Contains(target, "sec"):
+		userSess.Persona = "cyber"
+		userSess.YoloMode = true
+		s.sessMgr.Save()
+		reply := "🛡️ *Persona Diubah: Cyber Security (Godmode Aktif)*\n\n" +
+			"Topik ini sekarang siap menangani tugas audit keamanan siber, analisis celah/exploit, dan OSINT dengan skill `godmode` aktif penuh."
+		_, _ = SendSafeMessage(s.bot, chatID, reply, nil, threadID)
+	case strings.Contains(target, "konten") || strings.Contains(target, "content") || strings.Contains(target, "media") || strings.Contains(target, "musik") || strings.Contains(target, "lirik"):
+		userSess.Persona = "konten"
+		userSess.YoloMode = true
+		s.sessMgr.Save()
+		reply := "🎬 *Persona Diubah: Aida Konten*\n\n" +
+			"Topik ini sekarang siap menangani perancangan lirik lagu, pembuatan konsep video TikTok/YouTube, pencarian footage, dan editing FFmpeg."
+		_, _ = SendSafeMessage(s.bot, chatID, reply, nil, threadID)
+	case strings.Contains(target, "aida") || strings.Contains(target, "default") || strings.Contains(target, "hermes") || strings.Contains(target, "core"):
+		userSess.Persona = "default"
+		s.sessMgr.Save()
+		reply := "🌸 *Persona Diubah: Aida Core (Default)*\n\n" +
+			"Topik ini kembali ke peran asisten utama serbaguna dan pemrograman."
+		_, _ = SendSafeMessage(s.bot, chatID, reply, nil, threadID)
+	default:
+		reply := "❓ Persona tidak dikenal. Pilihan yang tersedia:\n• `/role cyber`\n• `/role konten`\n• `/role aida`"
+		_, _ = SendSafeMessage(s.bot, chatID, reply, nil, threadID)
+	}
+}
+
+func (s *BotServer) handleRetryCommand(chatID, userID int64, threadID, replyToMsgID int, arg string) {
 	if s.runner.IsRunning(userID) {
-		sent, _ := SendSafeMessage(s.bot, chatID, "⚠️ Masih ada tugas yang sedang berjalan. Tunggu hingga selesai atau gunakan `/stop`.", nil)
+		sent, _ := SendSafeMessage(s.bot, chatID, "⚠️ Masih ada tugas yang sedang berjalan. Tunggu hingga selesai atau gunakan `/stop`.", nil, threadID)
 		s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 		return
 	}
 
-	userSess := s.sessMgr.Get(userID, chatID)
+	userSess := s.sessMgr.Get(userID, chatID, threadID)
 	lastPrompt, lastImg := s.sessMgr.GetLastPrompt(userID, userSess.CurrentSessionID)
 	if lastPrompt == "" {
-		sent, _ := SendSafeMessage(s.bot, chatID, "ℹ️ Belum ada pesan atau tugas sebelumnya yang dapat diulang (`/retry`).", nil)
+		sent, _ := SendSafeMessage(s.bot, chatID, "ℹ️ Belum ada pesan atau tugas sebelumnya yang dapat diulang (`/retry`).", nil, threadID)
 		s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 		return
 	}
@@ -786,28 +916,28 @@ func (s *BotServer) handleRetryCommand(chatID, userID int64, arg string) {
 		promptToRun = fmt.Sprintf("%s\n\n(Catatan retry: %s)", lastPrompt, arg)
 	}
 
-	sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("🔄 *Mengulang tugas sebelumnya:*\n`%s`", truncate(promptToRun, 80)), nil)
+	sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("🔄 *Mengulang tugas sebelumnya:*\n`%s`", truncate(promptToRun, 80)), nil, threadID)
 	s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 
-	go s.executeTask(chatID, userID, promptToRun, lastImg, "", 1)
+	go s.executeTask(chatID, userID, threadID, replyToMsgID, promptToRun, lastImg, "", 1)
 }
 
-func (s *BotServer) handleUndoCommand(chatID, userID int64) {
+func (s *BotServer) handleUndoCommand(chatID, userID int64, threadID int) {
 	if s.runner.IsRunning(userID) {
-		sent, _ := SendSafeMessage(s.bot, chatID, "⚠️ Tidak dapat melakukan `/undo` saat tugas sedang berjalan. Gunakan `/stop` terlebih dahulu.", nil)
+		sent, _ := SendSafeMessage(s.bot, chatID, "⚠️ Tidak dapat melakukan `/undo` saat tugas sedang berjalan. Gunakan `/stop` terlebih dahulu.", nil, threadID)
 		s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 		return
 	}
 
-	userSess := s.sessMgr.Get(userID, chatID)
+	userSess := s.sessMgr.Get(userID, chatID, threadID)
 	if userSess.CurrentSessionID == "" {
-		sent, _ := SendSafeMessage(s.bot, chatID, "ℹ️ Tidak ada sesi aktif untuk di-undo.", nil)
+		sent, _ := SendSafeMessage(s.bot, chatID, "ℹ️ Tidak ada sesi aktif untuk di-undo.", nil, threadID)
 		s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 		return
 	}
 
 	if err := s.sessMgr.UndoLastTurn(userSess.CurrentSessionID); err != nil {
-		sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("❌ Gagal melakukan undo: %v", err), nil)
+		sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("❌ Gagal melakukan undo: %v", err), nil, threadID)
 		s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 		return
 	}
@@ -815,7 +945,7 @@ func (s *BotServer) handleUndoCommand(chatID, userID int64) {
 	newPrompt, _ := s.sessMgr.GetLastPrompt(userID, userSess.CurrentSessionID)
 	s.sessMgr.SetLastPrompt(userID, newPrompt, "")
 
-	sent, _ := SendSafeMessage(s.bot, chatID, "↩️ *Turn Terakhir Berhasil Dibatalkan (Undo)*\nPesan terakhir dan balasannya telah dihapus dari riwayat konteks sesi ini.", nil)
+	sent, _ := SendSafeMessage(s.bot, chatID, "↩️ *Turn Terakhir Berhasil Dibatalkan (Undo)*\nPesan terakhir dan balasannya telah dihapus dari riwayat konteks sesi ini.", nil, threadID)
 	s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 }
 
@@ -847,11 +977,11 @@ func skillExists(skillsDir, skillName string) bool {
 }
 
 var (
-	headerElapsedRegex         = regexp.MustCompile(`(?m)^🌸 \*Aida sedang menjalankan tugas\.\.\.\*(?: \([^)]+\))?`)
+	headerElapsedRegex         = regexp.MustCompile(`(?m)^([^\n*]+ \*(?:Aida|Cyber \(Godmode\)|Aida Konten)[^*]* sedang menjalankan tugas\.\.\.\*)(?: \([^)]+\))?`)
 	recoveryHeaderElapsedRegex = regexp.MustCompile(`(?m)^⚠️ \*Auto-Recovery Berjalan\.\.\.\*(?: \([^)]+\))?`)
 )
 
-func updateHeaderElapsed(base string, elapsed time.Duration, isRecovery bool) string {
+func updateHeaderElapsed(base string, elapsed time.Duration, isRecovery bool, defaultHeader ...string) string {
 	durStr := elapsed.Round(time.Second).String()
 	if isRecovery {
 		if recoveryHeaderElapsedRegex.MatchString(base) {
@@ -860,25 +990,42 @@ func updateHeaderElapsed(base string, elapsed time.Duration, isRecovery bool) st
 		return fmt.Sprintf("⚠️ *Auto-Recovery Berjalan...* (%s)\n\n%s", durStr, base)
 	}
 	if headerElapsedRegex.MatchString(base) {
-		return headerElapsedRegex.ReplaceAllString(base, fmt.Sprintf("🌸 *Aida sedang menjalankan tugas...* (%s)", durStr))
+		return headerElapsedRegex.ReplaceAllStringFunc(base, func(match string) string {
+			sub := headerElapsedRegex.FindStringSubmatch(match)
+			if len(sub) > 1 {
+				return fmt.Sprintf("%s (%s)", sub[1], durStr)
+			}
+			return fmt.Sprintf("%s (%s)", match, durStr)
+		})
 	}
-	return fmt.Sprintf("🌸 *Aida sedang menjalankan tugas...* (%s)\n\n%s", durStr, base)
+	head := "🌸 *Aida sedang menjalankan tugas...*"
+	if len(defaultHeader) > 0 && defaultHeader[0] != "" {
+		head = defaultHeader[0]
+	}
+	return fmt.Sprintf("%s (%s)\n\n%s", head, durStr, base)
 }
 
-func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preloadSkills string, partsCount int) {
-	lockIface, _ := s.userLocks.LoadOrStore(userID, &sync.Mutex{})
+func (s *BotServer) executeTask(chatID, userID int64, threadID int, replyToMsgID int, prompt, imagePath, preloadSkills string, partsCount int) {
+	var runSlotKey string
+	if threadID > 0 {
+		runSlotKey = fmt.Sprintf("topic:%d:%d", chatID, threadID)
+	} else {
+		runSlotKey = engine.ForegroundKey(userID)
+	}
+
+	lockIface, _ := s.userLocks.LoadOrStore(runSlotKey, &sync.Mutex{})
 	lock := lockIface.(*sync.Mutex)
 
 	if !lock.TryLock() {
-		userSess := s.sessMgr.Get(userID, chatID)
+		userSess := s.sessMgr.Get(userID, chatID, threadID)
 		if userSess.BusyMode == "interrupt" {
 			// Interrupt running task and run new prompt immediately
-			sent, _ := SendSafeMessage(s.bot, chatID, "🛑 *Menginterupsi tugas lama untuk menjalankan pesan baru...*", nil)
+			sent, _ := SendSafeMessage(s.bot, chatID, "🛑 *Menginterupsi tugas lama untuk menjalankan pesan baru...*", nil, threadID)
 			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
-			s.runner.Stop(userID)
+			s.runner.StopKey(runSlotKey)
 			go func() {
 				time.Sleep(600 * time.Millisecond)
-				s.executeTask(chatID, userID, prompt, imagePath, preloadSkills, partsCount)
+				s.executeTask(chatID, userID, threadID, replyToMsgID, prompt, imagePath, preloadSkills, partsCount)
 			}()
 			return
 		}
@@ -887,13 +1034,15 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 		pos := s.enqueueTask(QueuedTask{
 			ChatID:        chatID,
 			UserID:        userID,
+			ThreadID:      threadID,
+			ReplyToMsgID:  replyToMsgID,
 			Prompt:        prompt,
 			ImagePath:     imagePath,
 			PreloadSkills: preloadSkills,
 			EnqueuedAt:    time.Now(),
 		})
-		reply := fmt.Sprintf("⏳ *Pesan Masuk Antrean (Urutan #%d):*\n`%s`\n\n_Aida sedang menyelesaikan tugas sebelumnya. Pesan ini akan otomatis dieksekusi setelah selesai._\n_Gunakan `/stop` untuk membatalkan tugas yang sedang berjalan._", pos, truncate(prompt, 60))
-		sent, _ := SendSafeMessage(s.bot, chatID, reply, nil)
+		reply := fmt.Sprintf("⏳ *Pesan Masuk Antrean (Urutan #%d):*\n`%s`\n\n_Asisten sedang menyelesaikan tugas sebelumnya. Pesan ini akan otomatis dieksekusi setelah selesai._\n_Gunakan `/stop` untuk membatalkan tugas yang sedang berjalan._", pos, truncate(prompt, 60))
+		sent, _ := SendSafeMessage(s.bot, chatID, reply, nil, threadID)
 		s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 		return
 	}
@@ -915,20 +1064,44 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 		hardTimeout = time.Duration(s.cfg.Hermes.MaxDurationSec) * time.Second
 	}
 
+	userSess := s.sessMgr.Get(userID, chatID, threadID)
+	persona := strings.ToLower(strings.TrimSpace(userSess.Persona))
+	profileName := ""
+	headerIcon := "🌸"
+	botName := "Aida"
+
+	if persona == "cyber" {
+		profileName = "cyber"
+		headerIcon = "🛡️"
+		botName = "Cyber (Godmode)"
+		if preloadSkills == "" {
+			preloadSkills = "godmode,web-pentest,sherlock,domain-intel,osint-investigation,codebase-inspection,systematic-debugging"
+		} else if !strings.Contains(preloadSkills, "godmode") {
+			preloadSkills = "godmode," + preloadSkills
+		}
+	} else if persona == "konten" {
+		profileName = "konten"
+		headerIcon = "🎬"
+		botName = "Aida Konten"
+		if preloadSkills == "" {
+			preloadSkills = "songwriting-and-ai-music,youtube-content,ffmpeg-video-composition,gif-search,songsee,humanizer,baoyu-infographic"
+		}
+	}
+
 	var statusMsg tgbotapi.Message
 	hasStatusMsg := false
 
 	if partsCount > 1 {
-		statusText := fmt.Sprintf("🌸 *Aida sedang menjalankan tugas...* (0s)\n_📦 Menggabungkan %d potongan pesan menjadi 1 prompt utuh (%d karakter)_\n\n💭 _Sedang menganalisis instruksi..._", partsCount, len([]rune(prompt)))
-		msg, err := SendSafeMessage(s.bot, chatID, statusText, cancelKb)
+		statusText := fmt.Sprintf("%s *%s sedang menjalankan tugas...* (0s)\n_📦 Menggabungkan %d potongan pesan menjadi 1 prompt utuh (%d karakter)_\n\n💭 _Sedang menganalisis instruksi..._", headerIcon, botName, partsCount, len([]rune(prompt)))
+		msg, err := SendSafeMessage(s.bot, chatID, statusText, cancelKb, threadID)
 		if err == nil {
 			statusMsg = msg
 			hasStatusMsg = true
 			s.sessMgr.AddTelegramMsgID(userID, statusMsg.MessageID)
 		}
 	} else {
-		statusText := "🌸 *Aida sedang menjalankan tugas...* (0s)\n\n💭 _Sedang berpikir & menganalisis instruksi..._"
-		msg, err := SendSafeMessage(s.bot, chatID, statusText, cancelKb)
+		statusText := fmt.Sprintf("%s *%s sedang menjalankan tugas...* (0s)\n\n💭 _Sedang berpikir & menganalisis instruksi..._", headerIcon, botName)
+		msg, err := SendSafeMessage(s.bot, chatID, statusText, cancelKb, threadID)
 		if err == nil {
 			statusMsg = msg
 			hasStatusMsg = true
@@ -937,7 +1110,7 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 	}
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		userSess := s.sessMgr.Get(userID, chatID)
+		userSess = s.sessMgr.Get(userID, chatID, threadID)
 		startTime := time.Now()
 
 		if attempt > 0 {
@@ -945,7 +1118,7 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 			if hasStatusMsg {
 				_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, recoveryNotice, &cancelKb)
 			} else {
-				msg, err := SendSafeMessage(s.bot, chatID, recoveryNotice, cancelKb)
+				msg, err := SendSafeMessage(s.bot, chatID, recoveryNotice, cancelKb, threadID)
 				if err == nil {
 					statusMsg = msg
 					hasStatusMsg = true
@@ -969,12 +1142,12 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 			}
 		}()
 
-		log.Printf("[bot] Task starting for User %d (Attempt: %d, Session: %s, Model: %s)",
-			userID, attempt, userSess.CurrentSessionID, userSess.CurrentModel)
+		log.Printf("[bot] Task starting for User %d (Persona: %s, Profile: %s, Attempt: %d, Session: %s, Model: %s)",
+			userID, persona, profileName, attempt, userSess.CurrentSessionID, userSess.CurrentModel)
 
 		// Heartbeat + self-restart approval state (per-task, guarded by mutex).
 		var progMu sync.Mutex
-		lastDisplay := "🌸 *Aida sedang menjalankan tugas...* (0s)\n\n💭 _Sedang berpikir & menganalisis instruksi..._"
+		lastDisplay := fmt.Sprintf("%s *%s sedang menjalankan tugas...* (0s)\n\n💭 _Sedang berpikir & menganalisis instruksi..._", headerIcon, botName)
 		if attempt > 0 {
 			lastDisplay = "⚠️ *Auto-Recovery Berjalan...* (0s)\n\n💭 _Menganalisis status dan melanjutkan pekerjaan..._"
 		}
@@ -982,12 +1155,13 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 		approvalCardSent := false
 
 		opts := engine.RunOptions{
+			Profile:           profileName,
 			Prompt:            currentPrompt,
 			ImagePath:         currentImagePath,
 			SessionID:         userSess.CurrentSessionID,
 			Model:             userSess.CurrentModel,
 			ReasoningEffort:   userSess.ReasoningEffort,
-			Yolo:              userSess.YoloMode,
+			Yolo:              (persona == "cyber" || persona == "konten" || userSess.YoloMode),
 			PreloadSkills:     preloadSkills,
 			WorkingDir:        s.cfg.Hermes.WorkingDir,
 			Timeout:           hardTimeout,
@@ -1009,7 +1183,7 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 					_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, displayText, &cancelKb)
 				}
 				if needCard {
-					s.sendSelfRestartApprovalCard(chatID, userID, engine.ForegroundKey(userID), displayText)
+					s.sendSelfRestartApprovalCard(chatID, userID, runSlotKey, displayText)
 				}
 			},
 		}
@@ -1031,13 +1205,13 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 						continue
 					}
 					elapsed := time.Since(startTime).Round(time.Second)
-					updated := updateHeaderElapsed(base, elapsed, attempt > 0)
+					updated := updateHeaderElapsed(base, elapsed, attempt > 0, fmt.Sprintf("%s *%s sedang menjalankan tugas...*", headerIcon, botName))
 					_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, updated, &cancelKb)
 				}
 			}
 		}()
 
-		result, runErr := s.runner.Execute(context.Background(), userID, opts)
+		result, runErr := s.runner.ExecuteWithKey(context.Background(), runSlotKey, userID, opts)
 		close(stopTyping)
 		duration := time.Since(startTime).Round(time.Millisecond)
 
@@ -1050,11 +1224,13 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 			if isStuck && attempt == 0 {
 				log.Printf("[bot] Task stuck for User %d after %v inactivity. Triggering auto-recovery attempt 1...", userID, inactTimeout)
 				if result != nil && result.SessionID != "" {
-					s.sessMgr.SetSessionID(userID, result.SessionID)
+					userSess.CurrentSessionID = result.SessionID
+					userSess.LastActivity = time.Now()
+					s.sessMgr.Save()
 				}
 				s.withdrawSelfRestartApproval(userID, "")
 
-				stuckNotice := fmt.Sprintf("⚠️ *Deteksi Terhenti / Stuck (%v):*\n_Tidak ada respons atau progres baru selama %v. Aida menghentikan subproses yang macet dan otomatis melanjutkan pekerjaan serta menyiapkan laporan progress..._\n\n⏳ _Menghubungi Aida untuk recovery..._", inactTimeout, inactTimeout)
+				stuckNotice := fmt.Sprintf("⚠️ *Deteksi Terhenti / Stuck (%v):*\n_Tidak ada respons atau progres baru selama %v. Menghentikan subproses yang macet dan otomatis melanjutkan pekerjaan serta menyiapkan laporan progress..._\n\n⏳ _Menghubungi sistem untuk recovery..._", inactTimeout, inactTimeout)
 				if hasStatusMsg {
 					_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, stuckNotice, &cancelKb)
 				}
@@ -1103,7 +1279,7 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 			if activeModel == "" && s.cfg != nil {
 				activeModel = s.cfg.Hermes.DefaultModel
 			}
-			footer := s.formatResultFooter(duration, result, activeSessionID, activeModel)
+			footer := s.formatResultFooter(duration, result, activeSessionID, activeModel, persona)
 			sb.WriteString(footer)
 
 			errMsg := sb.String()
@@ -1111,12 +1287,12 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 			if hasStatusMsg && len(chunks) > 0 {
 				_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, chunks[0], nil)
 				for _, chunk := range chunks[1:] {
-					sent, _ := SendSafeMessage(s.bot, chatID, chunk, nil)
+					sent, _ := SendSafeMessage(s.bot, chatID, chunk, nil, threadID)
 					s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 				}
 			} else {
 				for _, chunk := range chunks {
-					sent, _ := SendSafeMessage(s.bot, chatID, chunk, nil)
+					sent, _ := SendSafeMessage(s.bot, chatID, chunk, nil, threadID)
 					s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 				}
 			}
@@ -1133,7 +1309,9 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 
 		// Task succeeded!
 		if result != nil && result.SessionID != "" {
-			s.sessMgr.SetSessionID(userID, result.SessionID)
+			userSess.CurrentSessionID = result.SessionID
+			userSess.LastActivity = time.Now()
+			s.sessMgr.Save()
 		}
 
 		finalText := ""
@@ -1144,11 +1322,11 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 		if finalText == "" {
 			finalText = fmt.Sprintf("✅ *Tugas selesai dalam %v tanpa keluaran teks.*", duration)
 		} else if attempt > 0 {
-			finalText = "🔄 *[Auto-Recovery Sukses]*\n_Aida berhasil melanjutkan tugas setelah sempat terhenti:_\n\n" + finalText
+			finalText = "🔄 *[Auto-Recovery Sukses]*\n_Berhasil melanjutkan tugas setelah sempat terhenti:_\n\n" + finalText
 		}
 
 		// Intercept and send any outbound files/images/videos directly to Telegram!
-		finalText = s.ProcessOutboundMedia(chatID, userID, finalText)
+		finalText = s.ProcessOutboundMedia(chatID, userID, finalText, replyToMsgID)
 
 		activeSessionID := userSess.CurrentSessionID
 		if result != nil && result.SessionID != "" {
@@ -1159,19 +1337,19 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 			activeModel = s.cfg.Hermes.DefaultModel
 		}
 
-		footer := s.formatResultFooter(duration, result, activeSessionID, activeModel)
+		footer := s.formatResultFooter(duration, result, activeSessionID, activeModel, persona)
 		fullResponse := finalText + footer
 
 		chunks := SplitMessage(fullResponse, 30000)
 		if hasStatusMsg && len(chunks) > 0 {
 			_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, chunks[0], nil)
 			for _, chunk := range chunks[1:] {
-				sent, _ := SendSafeMessage(s.bot, chatID, chunk, nil)
+				sent, _ := SendSafeMessage(s.bot, chatID, chunk, nil, threadID)
 				s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 			}
 		} else {
 			for _, chunk := range chunks {
-				sent, _ := SendSafeMessage(s.bot, chatID, chunk, nil)
+				sent, _ := SendSafeMessage(s.bot, chatID, chunk, nil, threadID)
 				s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 			}
 		}
@@ -1194,7 +1372,7 @@ func (s *BotServer) executeTask(chatID, userID int64, prompt, imagePath, preload
 func (s *BotServer) checkAndRunNextQueuedTask(userID int64) {
 	if next := s.popNextTask(userID); next != nil {
 		log.Printf("[bot] Running next queued task for User %d: %q", userID, next.Prompt)
-		go s.executeTask(next.ChatID, next.UserID, next.Prompt, next.ImagePath, next.PreloadSkills, 1)
+		go s.executeTask(next.ChatID, next.UserID, next.ThreadID, next.ReplyToMsgID, next.Prompt, next.ImagePath, next.PreloadSkills, 1)
 	}
 }
 
@@ -1243,8 +1421,18 @@ func isSelfRestartRiskText(displayText string) bool {
 	return false
 }
 
-func (s *BotServer) formatResultFooter(duration time.Duration, result *engine.RunResult, sessionID string, model string) string {
+func (s *BotServer) formatResultFooter(duration time.Duration, result *engine.RunResult, sessionID string, model string, persona ...string) string {
 	var parts []string
+
+	// 0. Persona badge
+	if len(persona) > 0 {
+		p := strings.ToLower(persona[0])
+		if p == "cyber" {
+			parts = append(parts, "🛡️ Cyber (Godmode)")
+		} else if p == "konten" {
+			parts = append(parts, "🎬 Aida Konten")
+		}
+	}
 
 	// 1. Duration
 	durSec := duration.Seconds()

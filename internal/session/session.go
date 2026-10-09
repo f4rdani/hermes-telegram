@@ -20,6 +20,8 @@ type TurnEntry struct {
 type UserSession struct {
 	UserID               int64       `json:"user_id"`
 	ChatID               int64       `json:"chat_id"`
+	ThreadID             int         `json:"thread_id,omitempty"`
+	Persona              string      `json:"persona,omitempty"` // "cyber", "konten", "default"
 	CurrentSessionID     string      `json:"current_session_id"`
 	CurrentModel         string      `json:"current_model"`
 	ReasoningEffort      string      `json:"reasoning_effort"`
@@ -45,16 +47,25 @@ type SessionSummary struct {
 
 type Manager struct {
 	mu           sync.RWMutex
-	sessions     map[int64]*UserSession
+	saveMu       sync.Mutex
+	saveWg       sync.WaitGroup
+	sessions     map[string]*UserSession
 	defaultModel string
 	storagePath  string
 	stateDBPath  string
 	hermesBin    string
 }
 
+func SessionKey(userID int64, chatID int64, threadID int) string {
+	if threadID > 0 {
+		return fmt.Sprintf("%d:%d", chatID, threadID)
+	}
+	return strconv.FormatInt(userID, 10)
+}
+
 func NewManager(defaultModel, storagePath, stateDBPath, hermesBin string) *Manager {
 	m := &Manager{
-		sessions:     make(map[int64]*UserSession),
+		sessions:     make(map[string]*UserSession),
 		defaultModel: defaultModel,
 		storagePath:  storagePath,
 		stateDBPath:  stateDBPath,
@@ -64,28 +75,54 @@ func NewManager(defaultModel, storagePath, stateDBPath, hermesBin string) *Manag
 	return m
 }
 
-func (m *Manager) Get(userID int64, chatID int64) *UserSession {
+func (m *Manager) findSession(userID int64) *UserSession {
+	key := strconv.FormatInt(userID, 10)
+	if s, ok := m.sessions[key]; ok {
+		return s
+	}
+	var latest *UserSession
+	for _, s := range m.sessions {
+		if s.UserID == userID {
+			if latest == nil || s.LastActivity.After(latest.LastActivity) {
+				latest = s
+			}
+		}
+	}
+	return latest
+}
+
+func (m *Manager) Get(userID int64, chatID int64, threadID ...int) *UserSession {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	s, ok := m.sessions[userID]
+	tid := 0
+	if len(threadID) > 0 {
+		tid = threadID[0]
+	}
+	key := SessionKey(userID, chatID, tid)
+
+	s, ok := m.sessions[key]
 	if !ok {
 		s = &UserSession{
 			UserID:          userID,
 			ChatID:          chatID,
+			ThreadID:        tid,
 			CurrentModel:    m.defaultModel,
 			ReasoningEffort: "high",
 			YoloMode:        true,
 			BusyMode:        "queue",
 			LastActivity:    time.Now(),
 		}
-		m.sessions[userID] = s
-		go m.saveState()
+		m.sessions[key] = s
+		m.triggerSave()
 	}
 	if s.BusyMode == "" {
 		s.BusyMode = "queue"
 	}
 	s.ChatID = chatID
+	if tid > 0 {
+		s.ThreadID = tid
+	}
 	s.LastActivity = time.Now()
 	return s
 }
@@ -93,40 +130,40 @@ func (m *Manager) Get(userID int64, chatID int64) *UserSession {
 func (m *Manager) SetSessionID(userID int64, sessionID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if s, ok := m.sessions[userID]; ok {
+	if s := m.findSession(userID); s != nil {
 		s.CurrentSessionID = sessionID
 		s.LastActivity = time.Now()
-		go m.saveState()
+		m.triggerSave()
 	}
 }
 
 func (m *Manager) SetModel(userID int64, model string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if s, ok := m.sessions[userID]; ok {
+	if s := m.findSession(userID); s != nil {
 		s.CurrentModel = model
 		s.LastActivity = time.Now()
-		go m.saveState()
+		m.triggerSave()
 	}
 }
 
 func (m *Manager) SetReasoning(userID int64, effort string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if s, ok := m.sessions[userID]; ok {
+	if s := m.findSession(userID); s != nil {
 		s.ReasoningEffort = effort
 		s.LastActivity = time.Now()
-		go m.saveState()
+		m.triggerSave()
 	}
 }
 
 func (m *Manager) ToggleYolo(userID int64) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if s, ok := m.sessions[userID]; ok {
+	if s := m.findSession(userID); s != nil {
 		s.YoloMode = !s.YoloMode
 		s.LastActivity = time.Now()
-		go m.saveState()
+		m.triggerSave()
 		return s.YoloMode
 	}
 	return false
@@ -135,40 +172,40 @@ func (m *Manager) ToggleYolo(userID int64) bool {
 func (m *Manager) SetBusyMode(userID int64, mode string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if s, ok := m.sessions[userID]; ok {
+	if s := m.findSession(userID); s != nil {
 		s.BusyMode = mode
 		s.LastActivity = time.Now()
-		go m.saveState()
+		m.triggerSave()
 	}
 }
 
 func (m *Manager) ResetSession(userID int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if s, ok := m.sessions[userID]; ok {
+	if s := m.findSession(userID); s != nil {
 		s.CurrentSessionID = ""
 		s.LastPrompt = ""
 		s.LastImagePath = ""
 		s.LastActivity = time.Now()
-		go m.saveState()
+		m.triggerSave()
 	}
 }
 
 func (m *Manager) SetLastPrompt(userID int64, prompt, imagePath string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if s, ok := m.sessions[userID]; ok {
+	if s := m.findSession(userID); s != nil {
 		s.LastPrompt = prompt
 		s.LastImagePath = imagePath
 		s.LastActivity = time.Now()
-		go m.saveState()
+		m.triggerSave()
 	}
 }
 
 func (m *Manager) GetLastPrompt(userID int64, sessionID string) (string, string) {
 	m.mu.RLock()
-	s, ok := m.sessions[userID]
-	if ok && s.LastPrompt != "" {
+	s := m.findSession(userID)
+	if s != nil && s.LastPrompt != "" {
 		p := s.LastPrompt
 		img := s.LastImagePath
 		m.mu.RUnlock()
@@ -180,7 +217,6 @@ func (m *Manager) GetLastPrompt(userID int64, sessionID string) (string, string)
 		return "", ""
 	}
 
-	// Fallback to SQLite state.db if bot process was restarted
 	query := fmt.Sprintf(
 		"SELECT content FROM messages WHERE session_id = '%s' AND role = 'user' ORDER BY id DESC LIMIT 1;",
 		strings.ReplaceAll(sessionID, "'", "''"),
@@ -208,11 +244,10 @@ func (m *Manager) UndoLastTurn(sessionID string) error {
 	return cmd.Run()
 }
 
-// StartTurn begins tracking a new user turn with their message ID
 func (m *Manager) StartTurn(userID int64, userMsgID int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if s, ok := m.sessions[userID]; ok {
+	if s := m.findSession(userID); s != nil {
 		var msgIDs []int
 		if userMsgID > 0 {
 			msgIDs = []int{userMsgID}
@@ -222,14 +257,14 @@ func (m *Manager) StartTurn(userID int64, userMsgID int) {
 			MsgIDs:    msgIDs,
 			Timestamp: time.Now(),
 		})
-		go m.saveState()
+		m.triggerSave()
 	}
 }
 
 func (m *Manager) AddTelegramMsgID(userID int64, msgID int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if s, ok := m.sessions[userID]; ok {
+	if s := m.findSession(userID); s != nil {
 		s.RecentTelegramMsgIDs = append(s.RecentTelegramMsgIDs, msgID)
 		if len(s.TrackedTurns) > 0 {
 			lastIdx := len(s.TrackedTurns) - 1
@@ -240,19 +275,16 @@ func (m *Manager) AddTelegramMsgID(userID int64, msgID int) {
 				Timestamp: time.Now(),
 			})
 		}
-		go m.saveState()
+		m.triggerSave()
 	}
 }
 
-// RecordTurn records a completed conversational turn (prompt, status, chunks, outbound media).
-// When tracked turns reach MaxTelegramTurns (default: 50 turns), it prunes older turns
-// down to 25 turns (MaxTelegramTurns / 2) and returns all message IDs that must be deleted from Telegram.
 func (m *Manager) RecordTurn(userID int64, msgIDs []int) []int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	s, ok := m.sessions[userID]
-	if !ok {
+	s := m.findSession(userID)
+	if s == nil {
 		return nil
 	}
 
@@ -275,12 +307,11 @@ func (m *Manager) RecordTurn(userID int64, msgIDs []int) []int {
 
 	maxTurns := s.MaxTelegramTurns
 	if maxTurns < 0 {
-		// Auto-delete disabled
-		go m.saveState()
+		m.triggerSave()
 		return nil
 	}
 	if maxTurns == 0 {
-		maxTurns = 50 // default: 50 turns
+		maxTurns = 50
 	}
 
 	targetKeep := maxTurns / 2
@@ -289,13 +320,13 @@ func (m *Manager) RecordTurn(userID int64, msgIDs []int) []int {
 	}
 
 	if len(s.TrackedTurns) < maxTurns {
-		go m.saveState()
+		m.triggerSave()
 		return nil
 	}
 
 	excess := len(s.TrackedTurns) - targetKeep
 	if excess <= 0 {
-		go m.saveState()
+		m.triggerSave()
 		return nil
 	}
 
@@ -318,26 +349,23 @@ func (m *Manager) RecordTurn(userID int64, msgIDs []int) []int {
 	}
 	s.RecentTelegramMsgIDs = remainingIDs
 
-	go m.saveState()
+	m.triggerSave()
 	return toDelete
 }
 
-// PruneTurns checks if turns have reached the limit and prunes them down to 25 turns.
 func (m *Manager) PruneTurns(userID int64) []int {
 	return m.RecordTurn(userID, nil)
 }
 
-// PopOldTelegramMsgIDs satisfies legacy compatibility if called directly
 func (m *Manager) PopOldTelegramMsgIDs(userID int64, maxCount int) []int {
 	return m.RecordTurn(userID, nil)
 }
 
-// ClearTelegramMsgIDs cleans all tracked turns and messages for user
 func (m *Manager) ClearTelegramMsgIDs(userID int64) []int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	s, ok := m.sessions[userID]
-	if !ok {
+	s := m.findSession(userID)
+	if s == nil {
 		return nil
 	}
 
@@ -360,27 +388,25 @@ func (m *Manager) ClearTelegramMsgIDs(userID int64) []int {
 
 	s.TrackedTurns = nil
 	s.RecentTelegramMsgIDs = nil
-	go m.saveState()
+	m.triggerSave()
 	return ids
 }
 
-// SetMaxTelegramTurns configures the max turns limit (e.g. 50, 20, 100, or -1 for disabled)
 func (m *Manager) SetMaxTelegramTurns(userID int64, maxTurns int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if s, ok := m.sessions[userID]; ok {
+	if s := m.findSession(userID); s != nil {
 		s.MaxTelegramTurns = maxTurns
 		s.LastActivity = time.Now()
-		go m.saveState()
+		m.triggerSave()
 	}
 }
 
-// GetAutoDeleteStats returns configuration and current turn counts
 func (m *Manager) GetAutoDeleteStats(userID int64) (maxTurns int, targetKeep int, currentTurns int, currentMsgs int, enabled bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	s, ok := m.sessions[userID]
-	if !ok {
+	s := m.findSession(userID)
+	if s == nil {
 		return 50, 25, 0, 0, true
 	}
 
@@ -412,10 +438,10 @@ func (m *Manager) loadState() {
 	if err != nil {
 		return
 	}
-	var stored map[int64]*UserSession
+	var stored map[string]*UserSession
 	if err := json.Unmarshal(data, &stored); err == nil {
-		for _, s := range stored {
-			// Migrate legacy RecentTelegramMsgIDs into TrackedTurns if TrackedTurns is empty
+		m.sessions = stored
+		for _, s := range m.sessions {
 			if len(s.TrackedTurns) == 0 && len(s.RecentTelegramMsgIDs) > 0 {
 				for i := 0; i < len(s.RecentTelegramMsgIDs); i += 2 {
 					end := i + 2
@@ -429,12 +455,22 @@ func (m *Manager) loadState() {
 				}
 			}
 		}
-		m.sessions = stored
 		log.Printf("[session] Loaded %d user sessions from %s", len(m.sessions), m.storagePath)
 	}
 }
 
+func (m *Manager) triggerSave() {
+	m.saveWg.Add(1)
+	go func() {
+		defer m.saveWg.Done()
+		m.saveState()
+	}()
+}
+
 func (m *Manager) saveState() {
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+
 	m.mu.RLock()
 	data, err := json.MarshalIndent(m.sessions, "", "  ")
 	m.mu.RUnlock()
@@ -445,6 +481,15 @@ func (m *Manager) saveState() {
 }
 
 func (m *Manager) SaveSync() {
+	m.saveWg.Wait()
+	m.saveState()
+}
+
+func (m *Manager) Wait() {
+	m.saveWg.Wait()
+}
+
+func (m *Manager) Save() {
 	m.saveState()
 }
 

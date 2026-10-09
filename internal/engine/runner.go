@@ -23,6 +23,7 @@ var (
 )
 
 type RunOptions struct {
+	Profile           string
 	Prompt            string
 	ImagePath         string
 	SessionID         string
@@ -141,11 +142,15 @@ func (r *Runner) ExecuteWithKey(ctx context.Context, key string, userID int64, o
 	_ = tmpFile.Close()
 
 	// Build arguments
-	args := []string{
+	var args []string
+	if opts.Profile != "" && opts.Profile != "default" {
+		args = append(args, "-p", opts.Profile)
+	}
+	args = append(args,
 		"chat",
 		"--query-file", tmpFilePath,
 		"--format", "stream-json",
-	}
+	)
 
 	if opts.SessionID != "" {
 		args = append(args, "--resume", opts.SessionID)

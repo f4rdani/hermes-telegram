@@ -61,7 +61,7 @@ func TestMessageAggregatorDebounce(t *testing.T) {
 	var resultParts int
 	done := make(chan struct{})
 
-	exec := func(chatID, userID int64, prompt, imagePath, preloadSkills string, partsCount int) {
+	exec := func(chatID, userID int64, threadID int, prompt, imagePath, preloadSkills string, partsCount int) {
 		resultPrompt = prompt
 		resultParts = partsCount
 		close(done)
@@ -80,9 +80,9 @@ func TestMessageAggregatorDebounce(t *testing.T) {
 		Text:      "Part 2 of message",
 	}
 
-	agg.Add(msg1, exec)
+	agg.Add(msg1, 0, exec)
 	time.Sleep(100 * time.Millisecond)
-	agg.Add(msg2, exec)
+	agg.Add(msg2, 0, exec)
 
 	select {
 	case <-done:

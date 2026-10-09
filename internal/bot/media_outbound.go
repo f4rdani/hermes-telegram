@@ -35,9 +35,13 @@ type ExtractedMedia struct {
 
 // ProcessOutboundMedia scans the agent's text response for media/file paths, sends them to Telegram,
 // and returns the sanitized text response with media tags replaced by user-friendly notices.
-func (s *BotServer) ProcessOutboundMedia(chatID, userID int64, text string) string {
+func (s *BotServer) ProcessOutboundMedia(chatID, userID int64, text string, replyToMsgID ...int) string {
 	seenPaths := make(map[string]bool)
 	var mediaList []ExtractedMedia
+	var targetReplyID int
+	if len(replyToMsgID) > 0 && replyToMsgID[0] > 0 {
+		targetReplyID = replyToMsgID[0]
+	}
 
 	// 1. Scan for explicit tags: VIDEO:<path>, MEDIA:<path>, FILE:<path>, DOCUMENT:<path>
 	tagMatches := mediaTagRegex.FindAllStringSubmatch(text, -1)
@@ -120,6 +124,10 @@ func (s *BotServer) ProcessOutboundMedia(chatID, userID int64, text string) stri
 			// VIDEO = native playable video bubble (streams inline, no download needed)
 			vid := tgbotapi.NewVideo(chatID, tgbotapi.FilePath(item.FilePath))
 			vid.SupportsStreaming = true
+			if targetReplyID > 0 {
+				vid.ReplyToMessageID = targetReplyID
+				vid.AllowSendingWithoutReply = true
+			}
 			if item.Caption != "" {
 				vid.Caption = item.Caption
 			}
@@ -127,6 +135,10 @@ func (s *BotServer) ProcessOutboundMedia(chatID, userID int64, text string) stri
 			if err != nil {
 				log.Printf("[bot] Failed to send outbound video (%s), falling back to document: %v", item.FilePath, err)
 				doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(item.FilePath))
+				if targetReplyID > 0 {
+					doc.ReplyToMessageID = targetReplyID
+					doc.AllowSendingWithoutReply = true
+				}
 				if item.Caption != "" {
 					doc.Caption = item.Caption
 				}
@@ -142,6 +154,10 @@ func (s *BotServer) ProcessOutboundMedia(chatID, userID int64, text string) stri
 			}
 		case item.IsImage:
 			photo := tgbotapi.NewPhoto(chatID, tgbotapi.FilePath(item.FilePath))
+			if targetReplyID > 0 {
+				photo.ReplyToMessageID = targetReplyID
+				photo.AllowSendingWithoutReply = true
+			}
 			if item.Caption != "" {
 				photo.Caption = item.Caption
 			}
@@ -154,6 +170,10 @@ func (s *BotServer) ProcessOutboundMedia(chatID, userID int64, text string) stri
 			}
 		default:
 			doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(item.FilePath))
+			if targetReplyID > 0 {
+				doc.ReplyToMessageID = targetReplyID
+				doc.AllowSendingWithoutReply = true
+			}
 			if item.Caption != "" {
 				doc.Caption = item.Caption
 			}

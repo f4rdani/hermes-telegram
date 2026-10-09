@@ -237,7 +237,7 @@ func MarkdownToTelegramHTML(text string) string {
 
 // SendRichMessage sends a rich message using Telegram 12.9+ Bot API 10.x sendRichMessage.
 // Supports native visual tables, headings, LaTeX math, blockquotes, checklists, up to 32,768 chars.
-func SendRichMessage(bot *tgbotapi.BotAPI, chatID int64, markdown string, replyMarkup interface{}) (tgbotapi.Message, error) {
+func SendRichMessage(bot *tgbotapi.BotAPI, chatID int64, markdown string, replyMarkup interface{}, threadID ...int) (tgbotapi.Message, error) {
 	// Auto-convert any legacy plain ASCII dash tables into native GFM tables so Telegram renders them visually
 	markdown = ConvertASCIITablesToGFM(markdown)
 
@@ -251,6 +251,9 @@ func SendRichMessage(bot *tgbotapi.BotAPI, chatID int64, markdown string, replyM
 	params := tgbotapi.Params{
 		"chat_id":      strconv.FormatInt(chatID, 10),
 		"rich_message": string(richJSON),
+	}
+	if len(threadID) > 0 && threadID[0] != 0 {
+		params["message_thread_id"] = strconv.Itoa(threadID[0])
 	}
 	_ = params.AddInterface("reply_markup", replyMarkup)
 
@@ -299,9 +302,9 @@ func EditRichMessage(bot *tgbotapi.BotAPI, chatID int64, messageID int, markdown
 
 // SendSafeMessage attempts to send a message using modern Telegram 12.9+ Rich Message (native tables, headings).
 // If rich message fails, it seamlessly falls back to legacy HTML, and finally plain text.
-func SendSafeMessage(bot *tgbotapi.BotAPI, chatID int64, text string, replyMarkup interface{}) (tgbotapi.Message, error) {
+func SendSafeMessage(bot *tgbotapi.BotAPI, chatID int64, text string, replyMarkup interface{}, threadID ...int) (tgbotapi.Message, error) {
 	// 1. Try modern Telegram 12.9 Rich Message first
-	msg, err := SendRichMessage(bot, chatID, text, replyMarkup)
+	msg, err := SendRichMessage(bot, chatID, text, replyMarkup, threadID...)
 	if err == nil {
 		return msg, nil
 	}
@@ -313,21 +316,29 @@ func SendSafeMessage(bot *tgbotapi.BotAPI, chatID int64, text string, replyMarku
 	var lastSent tgbotapi.Message
 	for i, chunk := range chunks {
 		htmlText := MarkdownToTelegramHTML(chunk)
-		m := tgbotapi.NewMessage(chatID, htmlText)
-		m.ParseMode = tgbotapi.ModeHTML
-		if i == len(chunks)-1 && replyMarkup != nil {
-			m.ReplyMarkup = replyMarkup
+		params := tgbotapi.Params{
+			"chat_id":    strconv.FormatInt(chatID, 10),
+			"text":       htmlText,
+			"parse_mode": "HTML",
 		}
-		sent, err := bot.Send(m)
+		if len(threadID) > 0 && threadID[0] != 0 {
+			params["message_thread_id"] = strconv.Itoa(threadID[0])
+		}
+		if i == len(chunks)-1 && replyMarkup != nil {
+			_ = params.AddInterface("reply_markup", replyMarkup)
+		}
+		apiResp, err := bot.MakeRequest("sendMessage", params)
 		if err != nil {
 			// Fallback to plain text
-			m.Text = chunk
-			m.ParseMode = ""
-			sent, err = bot.Send(m)
+			params["text"] = chunk
+			delete(params, "parse_mode")
+			apiResp, err = bot.MakeRequest("sendMessage", params)
 			if err != nil {
 				return lastSent, err
 			}
 		}
+		var sent tgbotapi.Message
+		_ = json.Unmarshal(apiResp.Result, &sent)
 		lastSent = sent
 	}
 	return lastSent, nil

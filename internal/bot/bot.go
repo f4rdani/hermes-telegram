@@ -298,6 +298,14 @@ func (s *BotServer) Start(ctx context.Context) error {
 					threadID = customUpdates[i].Message.MessageThreadID
 					topicCreated = customUpdates[i].Message.ForumTopicCreated
 				}
+				fromID := int64(0)
+				fromUser := ""
+				if update.Message.From != nil {
+					fromID = update.Message.From.ID
+					fromUser = update.Message.From.UserName
+				}
+				log.Printf("[bot] Incoming msg: Chat %d, Thread %d, From %d (%s), Text: %q",
+					update.Message.Chat.ID, threadID, fromID, fromUser, update.Message.Text)
 				go s.handleMessage(update.Message, threadID, topicCreated)
 			}
 		}
@@ -422,33 +430,34 @@ func (s *BotServer) handleMessage(msg *tgbotapi.Message, threadID int, topicCrea
 	// Track incoming user message ID as the start of a turn for 50-turn Telegram window
 	s.sessMgr.StartTurn(userID, msg.MessageID)
 
-	// 1. Check for Media message (photo, voice, audio, document)
-	hasMedia := len(msg.Photo) > 0 || msg.Voice != nil || msg.Audio != nil || msg.Document != nil
-	if hasMedia {
-		prompt, imagePath, err := ProcessMediaMessage(s.bot, msg, s.cfg.Hermes.MediaDir)
-		if err != nil {
-			sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("❌ Gagal memproses media: %v", err), nil, threadID)
-			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
-			return
-		}
-		s.executeTask(chatID, userID, threadID, msg.MessageID, prompt, imagePath, "", 1)
-		return
-	}
+	isForwarded := IsForwardedMessage(msg)
 
-	if text == "" {
-		return
-	}
-
-	// 2. Handle slash commands
-	if strings.HasPrefix(text, "/") {
+	// 1. Handle slash commands (only if not forwarded from another chat)
+	if !isForwarded && strings.HasPrefix(text, "/") {
 		s.aggregator.Cancel(userID)
 		s.dispatchCommand(msg, threadID, text)
 		return
 	}
 
-	// 3. Regular chat prompt execution via MessageAggregator (auto-stitches Telegram 4096-char split chunks)
-	s.aggregator.Add(msg, threadID, func(cID, uID int64, tID int, prompt, img, skills string, partsCount int) {
-		s.executeTask(cID, uID, tID, msg.MessageID, prompt, img, skills, partsCount)
+	// 2. Download media if present
+	hasMedia := len(msg.Photo) > 0 || msg.Voice != nil || msg.Audio != nil || msg.Document != nil
+	var mediaItem *DownloadedMediaItem
+	if hasMedia {
+		var err error
+		mediaItem, err = DownloadMessageMedia(s.bot, msg, s.cfg.Hermes.MediaDir)
+		if err != nil {
+			sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("❌ Gagal memproses media: %v", err), nil, threadID)
+			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
+		}
+	}
+
+	if mediaItem == nil && text == "" && msg.Caption == "" {
+		return
+	}
+
+	// 3. Prompt execution via MessageAggregator (auto-stitches split chunks, debounces media albums & forwarded bursts)
+	s.aggregator.AddWithMedia(msg, threadID, mediaItem, s.bot, func(cID, uID int64, tID int, replyToID int, prompt, img, skills string, partsCount int) {
+		s.executeTask(cID, uID, tID, replyToID, prompt, img, skills, partsCount)
 	})
 }
 
@@ -681,7 +690,7 @@ func (s *BotServer) dispatchCommand(msg *tgbotapi.Message, threadID int, rawText
 		}
 		s.executeTask(chatID, userID, threadID, replyToMsgID, prompt, "", "", 1)
 	case "/bg":
-		s.handleBgCommand(chatID, userID, arg)
+		s.handleBgCommand(chatID, userID, arg, threadID)
 	case "/btw":
 		if arg == "" {
 			sent, _ := SendSafeMessage(s.bot, chatID, "💬 *Pertanyaan Sampingan (By The Way):*\n\nFormat: `/btw <pertanyaan singkat>`\nMenanyakan pertanyaan sampingan tanpa merusak alur fokus.", nil, threadID)
@@ -857,10 +866,13 @@ func (s *BotServer) handleRoleCommand(msg *tgbotapi.Message, threadID int, arg s
 			curRole = "🛡️ *Cyber Security (Godmode Aktif)*"
 		} else if userSess.Persona == "konten" {
 			curRole = "🎬 *Aida Konten (Creative Director & Media)*"
+		} else if userSess.Persona == "yuki" {
+			curRole = "❄️ *Yuki (Istri Virtual)*"
 		}
 
 		reply := fmt.Sprintf("🎭 *Karakter & Soul Bot Saat Ini:*\n%s\n\n"+
 			"Gunakan perintah berikut untuk mengubah karakter di topik/sesi ini:\n"+
+			"• `/role yuki` — ❄️ Yuki (Istri virtual yang hangat, manja, dan sensual).\n"+
 			"• `/role cyber` — 🛡️ Keamanan siber, ethical hacking, exploit analysis & *Godmode Aktif*.\n"+
 			"• `/role konten` — 🎬 Pembuatan lirik musik, ide konten, riset footage, dan editing FFmpeg.\n"+
 			"• `/role aida` — 🌸 Asisten umum serbaguna, coding, dan Hermes core.\n",
@@ -870,6 +882,13 @@ func (s *BotServer) handleRoleCommand(msg *tgbotapi.Message, threadID int, arg s
 	}
 
 	switch {
+	case strings.Contains(target, "yuki"):
+		userSess.Persona = "yuki"
+		userSess.YoloMode = true
+		s.sessMgr.Save()
+		reply := "❄️ *Persona Diubah: Yuki*\n\n" +
+			"Topik ini sekarang terhubung ke profil dan jiwa (Soul) Yuki — istri virtual yang hangat, manja, dan sensual."
+		_, _ = SendSafeMessage(s.bot, chatID, reply, nil, threadID)
 	case strings.Contains(target, "cyber") || strings.Contains(target, "hack") || strings.Contains(target, "pentest") || strings.Contains(target, "sec"):
 		userSess.Persona = "cyber"
 		userSess.YoloMode = true
@@ -891,7 +910,7 @@ func (s *BotServer) handleRoleCommand(msg *tgbotapi.Message, threadID int, arg s
 			"Topik ini kembali ke peran asisten utama serbaguna dan pemrograman."
 		_, _ = SendSafeMessage(s.bot, chatID, reply, nil, threadID)
 	default:
-		reply := "❓ Persona tidak dikenal. Pilihan yang tersedia:\n• `/role cyber`\n• `/role konten`\n• `/role aida`"
+		reply := "❓ Persona tidak dikenal. Pilihan yang tersedia:\n• `/role yuki`\n• `/role cyber`\n• `/role konten`\n• `/role aida`"
 		_, _ = SendSafeMessage(s.bot, chatID, reply, nil, threadID)
 	}
 }
@@ -1086,6 +1105,10 @@ func (s *BotServer) executeTask(chatID, userID int64, threadID int, replyToMsgID
 		if preloadSkills == "" {
 			preloadSkills = "songwriting-and-ai-music,youtube-content,ffmpeg-video-composition,gif-search,songsee,humanizer,baoyu-infographic"
 		}
+	} else if persona == "yuki" {
+		profileName = "yuki"
+		headerIcon = "❄️"
+		botName = "Yuki"
 	}
 
 	var statusMsg tgbotapi.Message
@@ -1161,7 +1184,7 @@ func (s *BotServer) executeTask(chatID, userID int64, threadID int, replyToMsgID
 			SessionID:         userSess.CurrentSessionID,
 			Model:             userSess.CurrentModel,
 			ReasoningEffort:   userSess.ReasoningEffort,
-			Yolo:              (persona == "cyber" || persona == "konten" || userSess.YoloMode),
+			Yolo:              (persona == "cyber" || persona == "konten" || persona == "yuki" || userSess.YoloMode),
 			PreloadSkills:     preloadSkills,
 			WorkingDir:        s.cfg.Hermes.WorkingDir,
 			Timeout:           hardTimeout,
@@ -1326,7 +1349,7 @@ func (s *BotServer) executeTask(chatID, userID int64, threadID int, replyToMsgID
 		}
 
 		// Intercept and send any outbound files/images/videos directly to Telegram!
-		finalText = s.ProcessOutboundMedia(chatID, userID, finalText, replyToMsgID)
+		finalText = s.ProcessOutboundMedia(chatID, userID, finalText, threadID, replyToMsgID)
 
 		activeSessionID := userSess.CurrentSessionID
 		if result != nil && result.SessionID != "" {
@@ -1431,6 +1454,8 @@ func (s *BotServer) formatResultFooter(duration time.Duration, result *engine.Ru
 			parts = append(parts, "🛡️ Cyber (Godmode)")
 		} else if p == "konten" {
 			parts = append(parts, "🎬 Aida Konten")
+		} else if p == "yuki" {
+			parts = append(parts, "❄️ Yuki")
 		}
 	}
 

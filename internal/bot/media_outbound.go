@@ -1,78 +1,192 @@
 package bot
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 var (
-	// Matches VIDEO:<path>, MEDIA:<path>, FILE:<path>, DOCUMENT:<path>
-	mediaTagRegex = regexp.MustCompile(`(?i)(?:VIDEO|MEDIA|FILE|DOCUMENT):\s*[` + "`" + `\"'\"]?([/\w\.-]+)[` + "`" + `\"'\"]?`)
+	// Matches explicit tags: VIDEO:<path>, MEDIA:<path>, FILE:<path>, DOCUMENT:<path>, IMAGE:<path>, PHOTO:<path>, SCREENSHOT:<path>, AUDIO:<path>
+	mediaTagRegex = regexp.MustCompile(`(?i)(?:VIDEO|MEDIA|FILE|DOCUMENT|IMAGE|PHOTO|SCREENSHOT|AUDIO):\s*(?:[` + "`" + `\"']([^` + "`" + `\"'\n]+)[` + "`" + `\"']|([/\w\.\-]+))`)
 
 	// Matches markdown image syntax: ![alt](/path/to/image.png)
-	markdownImageRegex = regexp.MustCompile(`!\[([^\]]*)\]\(([/\w\.-]+)\)`)
+	markdownImageRegex = regexp.MustCompile(`!\[([^\]]*)\]\(([/\w\.\-]+)\)`)
 
-	// Matches markdown file link syntax: [title](/path/to/file.ext)
-	markdownLinkRegex = regexp.MustCompile(`\[([^\]]+)\]\(([/\w\.-]+\.(?:txt|pdf|zip|tar\.gz|gz|csv|json|py|go|sh|html|css|md|png|jpg|jpeg|webp|gif|mp4|mov|mkv|webm|mp3|m4a|ogg|wav))\)`)
+	// Matches markdown file link syntax: [title](/path/to/file.ext) - excludes code, scripts, and sensitive extensions
+	markdownLinkRegex = regexp.MustCompile(`\[([^\]]+)\]\(([/\w\.\-]+\.(?:pdf|zip|tar\.gz|gz|csv|png|jpg|jpeg|webp|gif|bmp|svg|mp4|mov|mkv|webm|mp3|m4a|ogg|wav|docx|xlsx|pptx|ass|srt))\)`)
 
-	// Fallback: bare absolute paths to video files without any tag, e.g. "/root/video.mp4"
-	// Catches cases where the agent forgets VIDEO: prefix or markdown wrapping.
-	plainVideoPathRegex = regexp.MustCompile(`(?m)(^|\s)(/[^\s` + "`" + `\"'\]\)]+?\.(?:mp4|mov|mkv|webm))`)
+	// Fallback: bare absolute file paths without any tag or markdown syntax.
+	// Only matches real media formats (images, videos, audio, PDF, ZIP, subtitles).
+	// NEVER matches code, scripts, configs, databases, or logs!
+	plainFilePathRegex = regexp.MustCompile(`(?i)(?:^|[\s\"'\(\[])(/[\w\.\-]+(?:/[\w\.\-]+)*\.(?:png|jpg|jpeg|webp|gif|bmp|svg|mp4|mov|mkv|webm|mp3|m4a|ogg|wav|pdf|zip|tar\.gz|gz|docx|xlsx|pptx|ass|srt))\b`)
+
+	blockedOutboundExtensions = map[string]bool{
+		".sh":      true,
+		".bash":    true,
+		".zsh":     true,
+		".py":      true,
+		".go":      true,
+		".js":      true,
+		".ts":      true,
+		".jsx":     true,
+		".tsx":     true,
+		".env":     true,
+		".db":      true,
+		".sqlite":  true,
+		".sqlite3": true,
+		".key":     true,
+		".pem":     true,
+		".crt":     true,
+		".json":    true,
+		".yaml":    true,
+		".yml":     true,
+		".toml":    true,
+		".ini":     true,
+		".conf":    true,
+		".service": true,
+		".bak":     true,
+		".old":     true,
+		".log":     true,
+		".html":    true,
+		".css":     true,
+		".c":       true,
+		".cpp":     true,
+		".h":       true,
+		".rs":      true,
+		".php":     true,
+	}
 )
+
+func isBlockedDirectory(path string) bool {
+	clean := filepath.Clean(path)
+	blockedPrefixes := []string{
+		"/root/scripts",
+		"/root/.ssh",
+		"/root/.hermes",
+		"/root/.gemini",
+		"/root/backups",
+		"/root/apps",
+		"/etc",
+		"/var",
+		"/proc",
+		"/sys",
+		"/usr",
+		"/bin",
+		"/sbin",
+		"/lib",
+		"/lib64",
+	}
+	for _, prefix := range blockedPrefixes {
+		if clean == prefix || strings.HasPrefix(clean, prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func isBlockedFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	if blockedOutboundExtensions[ext] {
+		return true
+	}
+	if isBlockedDirectory(path) {
+		return true
+	}
+	return false
+}
+
+func stripCodeBlocks(text string) string {
+	stripped := reFencedCode.ReplaceAllString(text, " ")
+	return reInlineCode.ReplaceAllString(stripped, " ")
+}
 
 type ExtractedMedia struct {
 	FilePath string
 	IsImage  bool
 	IsVideo  bool
+	IsAudio  bool
 	Caption  string
 }
 
 // ProcessOutboundMedia scans the agent's text response for media/file paths, sends them to Telegram,
 // and returns the sanitized text response with media tags replaced by user-friendly notices.
-func (s *BotServer) ProcessOutboundMedia(chatID, userID int64, text string, replyToMsgID ...int) string {
-	seenPaths := make(map[string]bool)
-	var mediaList []ExtractedMedia
+// targetIDs optionally accepts [threadID, replyToMsgID].
+func (s *BotServer) ProcessOutboundMedia(chatID, userID int64, text string, targetIDs ...int) string {
+	var threadID int
 	var targetReplyID int
-	if len(replyToMsgID) > 0 && replyToMsgID[0] > 0 {
-		targetReplyID = replyToMsgID[0]
+	if len(targetIDs) > 0 && targetIDs[0] > 0 {
+		threadID = targetIDs[0]
+	}
+	if len(targetIDs) > 1 && targetIDs[1] > 0 {
+		targetReplyID = targetIDs[1]
 	}
 
-	// 1. Scan for explicit tags: VIDEO:<path>, MEDIA:<path>, FILE:<path>, DOCUMENT:<path>
+	seenPaths := make(map[string]bool)
+	var mediaList []ExtractedMedia
+
+	// Helper to resolve and check file existence and safety
+	resolvePath := func(p string) (string, bool) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return "", false
+		}
+		// Security check: Never upload sensitive files or directories
+		if isBlockedFile(p) {
+			log.Printf("[bot] Blocked outbound upload of sensitive/system file: %s", p)
+			return "", false
+		}
+		if fileExists(p) {
+			return p, true
+		}
+		if !filepath.IsAbs(p) && s.cfg != nil && s.cfg.Hermes.WorkingDir != "" {
+			joined := filepath.Join(s.cfg.Hermes.WorkingDir, p)
+			if !isBlockedFile(joined) && fileExists(joined) {
+				return joined, true
+			}
+		}
+		return "", false
+	}
+
+	// 1. Scan for explicit tags: VIDEO:<path>, MEDIA:<path>, FILE:<path>, DOCUMENT:<path>, etc.
 	tagMatches := mediaTagRegex.FindAllStringSubmatch(text, -1)
 	for _, m := range tagMatches {
-		if len(m) > 1 {
-			p := strings.TrimSpace(m[1])
-			if !seenPaths[p] && fileExists(p) {
-				seenPaths[p] = true
-				mediaList = append(mediaList, ExtractedMedia{
-					FilePath: p,
-					IsImage:  isImageFile(p),
-					IsVideo:  isVideoFile(p),
-				})
-			}
+		p := strings.TrimSpace(m[1])
+		if p == "" && len(m) > 2 {
+			p = strings.TrimSpace(m[2])
+		}
+		if resolved, ok := resolvePath(p); ok && !seenPaths[resolved] {
+			seenPaths[resolved] = true
+			mediaList = append(mediaList, ExtractedMedia{
+				FilePath: resolved,
+				IsImage:  isImageFile(resolved),
+				IsVideo:  isVideoFile(resolved),
+				IsAudio:  isAudioFile(resolved),
+			})
 		}
 	}
 
 	// 2. Scan for markdown images: ![alt](/path)
-	// NOTE: video files are sometimes emitted as ![title](/path.mp4) — treat them as video, not photo.
 	imgMatches := markdownImageRegex.FindAllStringSubmatch(text, -1)
 	for _, m := range imgMatches {
 		if len(m) > 2 {
 			alt := strings.TrimSpace(m[1])
-			p := strings.TrimSpace(m[2])
-			if !seenPaths[p] && fileExists(p) {
-				seenPaths[p] = true
-				isVid := isVideoFile(p)
+			if resolved, ok := resolvePath(m[2]); ok && !seenPaths[resolved] {
+				seenPaths[resolved] = true
+				isVid := isVideoFile(resolved)
+				isAud := isAudioFile(resolved)
 				mediaList = append(mediaList, ExtractedMedia{
-					FilePath: p,
-					IsImage:  !isVid && isImageFile(p),
+					FilePath: resolved,
+					IsImage:  !isVid && !isAud && isImageFile(resolved),
 					IsVideo:  isVid,
+					IsAudio:  isAud,
 					Caption:  alt,
 				})
 			}
@@ -84,104 +198,47 @@ func (s *BotServer) ProcessOutboundMedia(chatID, userID int64, text string, repl
 	for _, m := range linkMatches {
 		if len(m) > 2 {
 			title := strings.TrimSpace(m[1])
-			p := strings.TrimSpace(m[2])
-			if !seenPaths[p] && fileExists(p) {
-				seenPaths[p] = true
-				isVid := isVideoFile(p)
+			if resolved, ok := resolvePath(m[2]); ok && !seenPaths[resolved] {
+				seenPaths[resolved] = true
+				isVid := isVideoFile(resolved)
+				isAud := isAudioFile(resolved)
 				mediaList = append(mediaList, ExtractedMedia{
-					FilePath: p,
-					IsImage:  !isVid && isImageFile(p),
+					FilePath: resolved,
+					IsImage:  !isVid && !isAud && isImageFile(resolved),
 					IsVideo:  isVid,
+					IsAudio:  isAud,
 					Caption:  title,
 				})
 			}
 		}
 	}
 
-	// 3b. Fallback: bare absolute video paths without VIDEO: tag or markdown.
-	// Ensures "kadang file kadang video" never happens just because the agent forgot the prefix.
-	plainMatches := plainVideoPathRegex.FindAllStringSubmatch(text, -1)
+	// 4. Fallback: bare absolute file paths without tags or markdown.
+	// Only scan text OUTSIDE code blocks and inline code backticks!
+	plainTextToScan := stripCodeBlocks(text)
+	plainMatches := plainFilePathRegex.FindAllStringSubmatch(plainTextToScan, -1)
 	for _, m := range plainMatches {
-		if len(m) > 2 {
-			p := strings.TrimSpace(m[2])
-			if !seenPaths[p] && fileExists(p) && isVideoFile(p) {
-				seenPaths[p] = true
+		if len(m) > 1 {
+			if resolved, ok := resolvePath(m[1]); ok && !seenPaths[resolved] {
+				seenPaths[resolved] = true
 				mediaList = append(mediaList, ExtractedMedia{
-					FilePath: p,
-					IsImage:  false,
-					IsVideo:  true,
+					FilePath: resolved,
+					IsImage:  isImageFile(resolved),
+					IsVideo:  isVideoFile(resolved),
+					IsAudio:  isAudioFile(resolved),
 				})
 			}
 		}
 	}
 
-	// 4. Send all extracted files/images/videos directly to Telegram
-	// Policy: try native playable video first, fallback to document on failure (e.g. >50MB Bot API limit).
-	// No auto-compress per user request — oversized videos arrive as files with a clear label.
+	// Send all extracted media directly to Telegram
 	for _, item := range mediaList {
-		switch {
-		case item.IsVideo:
-			// VIDEO = native playable video bubble (streams inline, no download needed)
-			vid := tgbotapi.NewVideo(chatID, tgbotapi.FilePath(item.FilePath))
-			vid.SupportsStreaming = true
-			if targetReplyID > 0 {
-				vid.ReplyToMessageID = targetReplyID
-				vid.AllowSendingWithoutReply = true
-			}
-			if item.Caption != "" {
-				vid.Caption = item.Caption
-			}
-			sent, err := s.bot.Send(vid)
-			if err != nil {
-				log.Printf("[bot] Failed to send outbound video (%s), falling back to document: %v", item.FilePath, err)
-				doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(item.FilePath))
-				if targetReplyID > 0 {
-					doc.ReplyToMessageID = targetReplyID
-					doc.AllowSendingWithoutReply = true
-				}
-				if item.Caption != "" {
-					doc.Caption = item.Caption
-				}
-				if sentDoc, errDoc := s.bot.Send(doc); errDoc == nil {
-					log.Printf("[bot] Successfully sent document (video fallback) %s (msg_id: %d)", item.FilePath, sentDoc.MessageID)
-					s.sessMgr.AddTelegramMsgID(userID, sentDoc.MessageID)
-				} else {
-					log.Printf("[bot] Failed to send outbound document fallback (%s): %v", item.FilePath, errDoc)
-				}
-			} else {
-				log.Printf("[bot] Successfully sent video %s (msg_id: %d)", item.FilePath, sent.MessageID)
-				s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
-			}
-		case item.IsImage:
-			photo := tgbotapi.NewPhoto(chatID, tgbotapi.FilePath(item.FilePath))
-			if targetReplyID > 0 {
-				photo.ReplyToMessageID = targetReplyID
-				photo.AllowSendingWithoutReply = true
-			}
-			if item.Caption != "" {
-				photo.Caption = item.Caption
-			}
-			sent, err := s.bot.Send(photo)
-			if err != nil {
-				log.Printf("[bot] Failed to send outbound photo (%s): %v", item.FilePath, err)
-			} else {
-				log.Printf("[bot] Successfully sent photo %s (msg_id: %d)", item.FilePath, sent.MessageID)
-				s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
-			}
-		default:
-			doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(item.FilePath))
-			if targetReplyID > 0 {
-				doc.ReplyToMessageID = targetReplyID
-				doc.AllowSendingWithoutReply = true
-			}
-			if item.Caption != "" {
-				doc.Caption = item.Caption
-			}
-			sent, err := s.bot.Send(doc)
-			if err != nil {
-				log.Printf("[bot] Failed to send outbound document (%s): %v", item.FilePath, err)
-			} else {
-				log.Printf("[bot] Successfully sent document %s (msg_id: %d)", item.FilePath, sent.MessageID)
+		sent, err := s.uploadMediaFile(chatID, threadID, targetReplyID, item)
+		if err != nil {
+			log.Printf("[bot] Failed to send outbound media (%s): %v", item.FilePath, err)
+		} else if sent != nil && sent.MessageID > 0 {
+			log.Printf("[bot] Successfully sent media %s (msg_id: %d, thread_id: %d)", item.FilePath, sent.MessageID, threadID)
+			if s.sessMgr != nil {
 				s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 			}
 		}
@@ -191,25 +248,124 @@ func (s *BotServer) ProcessOutboundMedia(chatID, userID int64, text string, repl
 	cleanText := text
 	for p := range seenPaths {
 		base := filepath.Base(p)
+		escaped := regexp.QuoteMeta(p)
+
+		tagRe := regexp.MustCompile(`(?mi)^.*(?:VIDEO|MEDIA|FILE|DOCUMENT|IMAGE|PHOTO|SCREENSHOT|AUDIO):\s*[` + "`" + `\"']?` + escaped + `[` + "`" + `\"']?.*$\n?`)
+		imgRe := regexp.MustCompile(`!\[[^\]]*\]\(` + escaped + `\)`)
+		linkRe := regexp.MustCompile(`\[[^\]]+\]\(` + escaped + `\)`)
+		loneRe := regexp.MustCompile(`(?m)^\s*[` + "`" + `\"']?` + escaped + `[` + "`" + `\"']?\s*$\n?`)
+
 		switch {
 		case isVideoFile(p):
-			re := regexp.MustCompile(`(?m)^.*(?:VIDEO|MEDIA|FILE|DOCUMENT):\s*[` + "`" + `\"'\"]?` + regexp.QuoteMeta(p) + `[` + "`" + `\"'\"]?.*$\n?`)
-			cleanText = re.ReplaceAllString(cleanText, fmt.Sprintf("🎬 _[Video terkirim: `%s`]\n", base))
-			// Also collapse markdown image/link wrappers for videos to the same notice.
-			reImg := regexp.MustCompile(`!\[[^\]]*\]\(` + regexp.QuoteMeta(p) + `\)`)
-			cleanText = reImg.ReplaceAllString(cleanText, fmt.Sprintf("🎬 _[Video terkirim: `%s`]", base))
-			reLink := regexp.MustCompile(`\[[^\]]+\]\(` + regexp.QuoteMeta(p) + `\)`)
-			cleanText = reLink.ReplaceAllString(cleanText, fmt.Sprintf("🎬 _[Video terkirim: `%s`]", base))
+			notice := fmt.Sprintf("🎬 _[Video terkirim: `%s`]", base)
+			cleanText = tagRe.ReplaceAllString(cleanText, notice+"\n")
+			cleanText = imgRe.ReplaceAllString(cleanText, notice)
+			cleanText = linkRe.ReplaceAllString(cleanText, notice)
+			cleanText = loneRe.ReplaceAllString(cleanText, notice+"\n")
 		case isImageFile(p):
-			re := regexp.MustCompile(`(?m)^.*(?:VIDEO|MEDIA|FILE|DOCUMENT):\s*[` + "`" + `\"'\"]?` + regexp.QuoteMeta(p) + `[` + "`" + `\"'\"]?.*$\n?`)
-			cleanText = re.ReplaceAllString(cleanText, fmt.Sprintf("🖼️ _[Foto / Screenshot terkirim: `%s`]\n", base))
+			notice := fmt.Sprintf("🖼️ _[Foto / Screenshot terkirim: `%s`]", base)
+			cleanText = tagRe.ReplaceAllString(cleanText, notice+"\n")
+			cleanText = imgRe.ReplaceAllString(cleanText, notice)
+			cleanText = linkRe.ReplaceAllString(cleanText, notice)
+			cleanText = loneRe.ReplaceAllString(cleanText, notice+"\n")
+		case isAudioFile(p):
+			notice := fmt.Sprintf("🎵 _[Audio terkirim: `%s`]", base)
+			cleanText = tagRe.ReplaceAllString(cleanText, notice+"\n")
+			cleanText = imgRe.ReplaceAllString(cleanText, notice)
+			cleanText = linkRe.ReplaceAllString(cleanText, notice)
+			cleanText = loneRe.ReplaceAllString(cleanText, notice+"\n")
 		default:
-			re := regexp.MustCompile(`(?m)^.*(?:VIDEO|MEDIA|FILE|DOCUMENT):\s*[` + "`" + `\"'\"]?` + regexp.QuoteMeta(p) + `[` + "`" + `\"'\"]?.*$\n?`)
-			cleanText = re.ReplaceAllString(cleanText, fmt.Sprintf("📎 _[File dokumen terkirim: `%s`]\n", base))
+			notice := fmt.Sprintf("📎 _[File dokumen terkirim: `%s`]", base)
+			cleanText = tagRe.ReplaceAllString(cleanText, notice+"\n")
+			cleanText = imgRe.ReplaceAllString(cleanText, notice)
+			cleanText = linkRe.ReplaceAllString(cleanText, notice)
+			cleanText = loneRe.ReplaceAllString(cleanText, notice+"\n")
 		}
 	}
 
 	return cleanText
+}
+
+// uploadMediaFile uploads a single file to Telegram using native UploadFiles API.
+// It supports topic routing via message_thread_id, streaming playback for video,
+// and falls back gracefully to sendDocument if the media format or size exceeds limits.
+func (s *BotServer) uploadMediaFile(chatID int64, threadID int, replyToMsgID int, item ExtractedMedia) (*tgbotapi.Message, error) {
+	if s.bot == nil {
+		return nil, fmt.Errorf("telegram bot instance is nil")
+	}
+
+	endpoint := "sendDocument"
+	field := "document"
+	switch {
+	case item.IsImage:
+		endpoint = "sendPhoto"
+		field = "photo"
+	case item.IsVideo:
+		endpoint = "sendVideo"
+		field = "video"
+	case item.IsAudio:
+		endpoint = "sendAudio"
+		field = "audio"
+	}
+
+	params := tgbotapi.Params{
+		"chat_id": strconv.FormatInt(chatID, 10),
+	}
+	if threadID > 0 {
+		params["message_thread_id"] = strconv.Itoa(threadID)
+	}
+	if replyToMsgID > 0 {
+		params["reply_to_message_id"] = strconv.Itoa(replyToMsgID)
+		params["allow_sending_without_reply"] = "true"
+	}
+	if item.Caption != "" {
+		params["caption"] = item.Caption
+	}
+	if item.IsVideo {
+		params["supports_streaming"] = "true"
+	}
+
+	reqFile := tgbotapi.RequestFile{
+		Name: field,
+		Data: tgbotapi.FilePath(item.FilePath),
+	}
+
+	apiResp, err := s.bot.UploadFiles(endpoint, params, []tgbotapi.RequestFile{reqFile})
+	if err != nil {
+		// If photo, video, or audio fails (e.g. format rejection, dimension issue), fallback to sendDocument
+		if endpoint != "sendDocument" {
+			log.Printf("[bot] Failed to send %s (%s): %v, falling back to sendDocument", field, item.FilePath, err)
+			docParams := tgbotapi.Params{
+				"chat_id": strconv.FormatInt(chatID, 10),
+			}
+			if threadID > 0 {
+				docParams["message_thread_id"] = strconv.Itoa(threadID)
+			}
+			if replyToMsgID > 0 {
+				docParams["reply_to_message_id"] = strconv.Itoa(replyToMsgID)
+				docParams["allow_sending_without_reply"] = "true"
+			}
+			if item.Caption != "" {
+				docParams["caption"] = item.Caption
+			}
+			docFile := tgbotapi.RequestFile{
+				Name: "document",
+				Data: tgbotapi.FilePath(item.FilePath),
+			}
+			apiRespDoc, errDoc := s.bot.UploadFiles("sendDocument", docParams, []tgbotapi.RequestFile{docFile})
+			if errDoc != nil {
+				return nil, fmt.Errorf("%s failed (%v) and fallback sendDocument also failed: %w", field, err, errDoc)
+			}
+			var sentDoc tgbotapi.Message
+			_ = json.Unmarshal(apiRespDoc.Result, &sentDoc)
+			return &sentDoc, nil
+		}
+		return nil, err
+	}
+
+	var sent tgbotapi.Message
+	_ = json.Unmarshal(apiResp.Result, &sent)
+	return &sent, nil
 }
 
 func fileExists(path string) bool {
@@ -234,6 +390,16 @@ func isVideoFile(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
 	case ".mp4", ".mov", ".mkv", ".webm":
+		return true
+	default:
+		return false
+	}
+}
+
+func isAudioFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".mp3", ".m4a", ".ogg", ".wav":
 		return true
 	default:
 		return false

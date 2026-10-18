@@ -18,3 +18,4 @@ sessions.json
 .DS_Store
 *.swp
 *~
+*.bak*

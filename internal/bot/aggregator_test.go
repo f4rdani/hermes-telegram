@@ -96,3 +96,133 @@ func TestMessageAggregatorDebounce(t *testing.T) {
 		t.Fatal("Debounce timer did not fire in time")
 	}
 }
+
+func TestMessageAggregator_ForwardedBurst(t *testing.T) {
+	agg := NewMessageAggregator()
+
+	var resultPrompt string
+	var resultParts int
+	done := make(chan struct{})
+
+	exec := func(chatID, userID int64, threadID int, replyToID int, prompt, imagePath, preloadSkills string, partsCount int) {
+		resultPrompt = prompt
+		resultParts = partsCount
+		close(done)
+	}
+
+	msg1 := &tgbotapi.Message{
+		MessageID: 201,
+		From:      &tgbotapi.User{ID: 11111},
+		Chat:      &tgbotapi.Chat{ID: 22222},
+		Text:      "Lirik lagu bagian intro",
+		ForwardFrom: &tgbotapi.User{
+			ID:        999,
+			FirstName: "Composer",
+		},
+	}
+	msg2 := &tgbotapi.Message{
+		MessageID: 202,
+		From:      &tgbotapi.User{ID: 11111},
+		Chat:      &tgbotapi.Chat{ID: 22222},
+		Text:      "Bait kedua di menit 01:20",
+		ForwardFrom: &tgbotapi.User{
+			ID:        999,
+			FirstName: "Composer",
+		},
+	}
+
+	agg.AddWithMedia(msg1, 0, nil, nil, exec)
+	time.Sleep(50 * time.Millisecond)
+	agg.AddWithMedia(msg2, 0, nil, nil, exec)
+
+	select {
+	case <-done:
+		if resultParts != 2 {
+			t.Errorf("Expected 2 parts, got %d", resultParts)
+		}
+		if !strings.Contains(resultPrompt, "[Pesan Terusan (Forwarded Messages)]") {
+			t.Errorf("Expected forwarded section, got: %s", resultPrompt)
+		}
+		if !strings.Contains(resultPrompt, "Composer") {
+			t.Errorf("Expected composer attribution, got: %s", resultPrompt)
+		}
+		if !strings.Contains(resultPrompt, "Lirik lagu bagian intro") || !strings.Contains(resultPrompt, "Bait kedua di menit 01:20") {
+			t.Errorf("Missing expected lyrics in prompt: %s", resultPrompt)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Forward debounce timer did not fire in time")
+	}
+}
+
+func TestMessageAggregator_MediaBatchAndUserInstruction(t *testing.T) {
+	agg := NewMessageAggregator()
+
+	var resultPrompt string
+	var resultImg string
+	done := make(chan struct{})
+
+	exec := func(chatID, userID int64, threadID int, replyToID int, prompt, imagePath, preloadSkills string, partsCount int) {
+		resultPrompt = prompt
+		resultImg = imagePath
+		close(done)
+	}
+
+	media1 := &DownloadedMediaItem{
+		FileName:  "shorekeeper_crop.jpg",
+		FilePath:  "/tmp/shorekeeper_crop.jpg",
+		MediaType: "photo",
+		IsImage:   true,
+		SizeBytes: 150000,
+	}
+	msg1 := &tgbotapi.Message{
+		MessageID: 301,
+		From:      &tgbotapi.User{ID: 33333},
+		Chat:      &tgbotapi.Chat{ID: 44444},
+	}
+
+	media2 := &DownloadedMediaItem{
+		FileName:  "AnUnfinishedSong.ass",
+		FilePath:  "/tmp/AnUnfinishedSong.ass",
+		MediaType: "document",
+		IsText:    true,
+		TextContent: "[Script Info]\nTitle: An Unfinished Song",
+		SizeBytes: 5000,
+	}
+	msg2 := &tgbotapi.Message{
+		MessageID: 302,
+		From:      &tgbotapi.User{ID: 33333},
+		Chat:      &tgbotapi.Chat{ID: 44444},
+		Caption:   "Ini file subtitle dan crop",
+	}
+
+	msg3 := &tgbotapi.Message{
+		MessageID: 303,
+		From:      &tgbotapi.User{ID: 33333},
+		Chat:      &tgbotapi.Chat{ID: 44444},
+		Text:      "Tolong render video liriknya sekarang",
+	}
+
+	agg.AddWithMedia(msg1, 0, media1, nil, exec)
+	time.Sleep(50 * time.Millisecond)
+	agg.AddWithMedia(msg2, 0, media2, nil, exec)
+	time.Sleep(50 * time.Millisecond)
+	agg.AddWithMedia(msg3, 0, nil, nil, exec)
+
+	select {
+	case <-done:
+		if resultImg != "/tmp/shorekeeper_crop.jpg" {
+			t.Errorf("Expected primary image /tmp/shorekeeper_crop.jpg, got: %s", resultImg)
+		}
+		if !strings.Contains(resultPrompt, "/tmp/shorekeeper_crop.jpg") {
+			t.Errorf("Missing photo in prompt: %s", resultPrompt)
+		}
+		if !strings.Contains(resultPrompt, "AnUnfinishedSong.ass") {
+			t.Errorf("Missing ass subtitle in prompt: %s", resultPrompt)
+		}
+		if !strings.Contains(resultPrompt, "Tolong render video liriknya sekarang") {
+			t.Errorf("Missing user instruction in prompt: %s", resultPrompt)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Media batch debounce timer did not fire in time")
+	}
+}

@@ -20,6 +20,7 @@ type BackgroundTask struct {
 	ID        string
 	UserID    int64
 	ChatID    int64
+	ThreadID  int
 	Prompt    string
 	SessionID string // fresh Hermes session created by the run ("" until known)
 	Status    string // running | done | failed | cancelled
@@ -43,10 +44,15 @@ func (s *BotServer) countUserBgRunningLocked(userID int64) int {
 	return n
 }
 
-func (s *BotServer) handleBgCommand(chatID, userID int64, arg string) {
+func (s *BotServer) handleBgCommand(chatID, userID int64, arg string, threadID ...int) {
+	var targetThread int
+	if len(threadID) > 0 {
+		targetThread = threadID[0]
+	}
+
 	arg = strings.TrimSpace(arg)
 	if arg == "" {
-		sent, _ := SendSafeMessage(s.bot, chatID, "⚙️ *Tugas Latar Belakang (Background Task):*\n\nFormat: `/bg <instruksi tugas>`\nBerjalan di sesi Hermes terpisah — kamu bisa lanjut chat, hasilnya dikirim saat selesai.", nil)
+		sent, _ := SendSafeMessage(s.bot, chatID, "⚙️ *Tugas Latar Belakang (Background Task):*\n\nFormat: `/bg <instruksi tugas>`\nBerjalan di sesi Hermes terpisah — kamu bisa lanjut chat, hasilnya dikirim saat selesai.", nil, targetThread)
 		s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 		return
 	}
@@ -54,7 +60,7 @@ func (s *BotServer) handleBgCommand(chatID, userID int64, arg string) {
 	s.bgMu.Lock()
 	if s.countUserBgRunningLocked(userID) >= maxBackgroundPerUser {
 		s.bgMu.Unlock()
-		sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("⚠️ *Batas Background Tercapai:*\nMaksimal %d tugas latar berjalan per user. Tunggu selesai atau batalkan via `/stop`.", maxBackgroundPerUser), nil)
+		sent, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("⚠️ *Batas Background Tercapai:*\nMaksimal %d tugas latar berjalan per user. Tunggu selesai atau batalkan via `/stop`.", maxBackgroundPerUser), nil, targetThread)
 		s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 		return
 	}
@@ -63,6 +69,7 @@ func (s *BotServer) handleBgCommand(chatID, userID int64, arg string) {
 		ID:        fmt.Sprintf("bg_%s_%d", time.Now().Format("150405"), s.bgSeq),
 		UserID:    userID,
 		ChatID:    chatID,
+		ThreadID:  targetThread,
 		Prompt:    arg,
 		Status:    "running",
 		StartedAt: time.Now(),
@@ -74,17 +81,17 @@ func (s *BotServer) handleBgCommand(chatID, userID int64, arg string) {
 	s.bgTasks[task.ID] = task
 	s.bgMu.Unlock()
 
-	notice, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("🔄 *Background Task Dimulai:*\n🆔 `%s`\n`%s`\n\n_Kamu bisa lanjut chat — hasilnya dikirim di sini saat selesai._", task.ID, truncate(arg, 80)), nil)
+	notice, _ := SendSafeMessage(s.bot, chatID, fmt.Sprintf("🔄 *Background Task Dimulai:*\n🆔 `%s`\n`%s`\n\n_Kamu bisa lanjut chat — hasilnya dikirim di sini saat selesai._", task.ID, truncate(arg, 80)), nil, targetThread)
 	s.sessMgr.AddTelegramMsgID(userID, notice.MessageID)
 	go s.executeBackgroundTask(task)
 }
 
 func (s *BotServer) executeBackgroundTask(task *BackgroundTask) {
 	userID, chatID := task.UserID, task.ChatID
-	userSess := s.sessMgr.Get(userID, chatID)
+	userSess := s.sessMgr.Get(userID, chatID, task.ThreadID)
 
 	cancelKb := CancelKeyboard()
-	statusMsg, err := SendSafeMessage(s.bot, chatID, fmt.Sprintf("🔄 *Background `%s` berjalan...*\n\n💭 _Sedang berpikir & menganalisis instruksi..._", task.ID), cancelKb)
+	statusMsg, err := SendSafeMessage(s.bot, chatID, fmt.Sprintf("🔄 *Background `%s` berjalan...*\n\n💭 _Sedang berpikir & menganalisis instruksi..._", task.ID), cancelKb, task.ThreadID)
 	hasStatusMsg := err == nil
 	if hasStatusMsg {
 		s.sessMgr.AddTelegramMsgID(userID, statusMsg.MessageID)
@@ -159,7 +166,7 @@ func (s *BotServer) executeBackgroundTask(task *BackgroundTask) {
 		if hasStatusMsg {
 			_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, errText, nil)
 		} else {
-			sent, _ := SendSafeMessage(s.bot, chatID, errText, nil)
+			sent, _ := SendSafeMessage(s.bot, chatID, errText, nil, task.ThreadID)
 			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 		}
 		return
@@ -174,7 +181,7 @@ func (s *BotServer) executeBackgroundTask(task *BackgroundTask) {
 	} else {
 		finalText = fmt.Sprintf("✅ *Background `%s` Selesai:*\n\n%s", task.ID, finalText)
 	}
-	finalText = s.ProcessOutboundMedia(chatID, userID, finalText)
+	finalText = s.ProcessOutboundMedia(chatID, userID, finalText, task.ThreadID)
 
 	activeSessionID := ""
 	if result != nil {
@@ -187,12 +194,12 @@ func (s *BotServer) executeBackgroundTask(task *BackgroundTask) {
 	if hasStatusMsg && len(chunks) > 0 {
 		_, _ = EditSafeMessage(s.bot, chatID, statusMsg.MessageID, chunks[0], nil)
 		for _, chunk := range chunks[1:] {
-			sent, _ := SendSafeMessage(s.bot, chatID, chunk, nil)
+			sent, _ := SendSafeMessage(s.bot, chatID, chunk, nil, task.ThreadID)
 			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 		}
 	} else {
 		for _, chunk := range chunks {
-			sent, _ := SendSafeMessage(s.bot, chatID, chunk, nil)
+			sent, _ := SendSafeMessage(s.bot, chatID, chunk, nil, task.ThreadID)
 			s.sessMgr.AddTelegramMsgID(userID, sent.MessageID)
 		}
 	}

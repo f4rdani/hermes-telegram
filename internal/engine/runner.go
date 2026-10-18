@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -191,13 +190,7 @@ func (r *Runner) ExecuteWithKey(ctx context.Context, key string, userID int64, o
 	cmd.Env = append(os.Environ(), "PYTHONUNBUFFERED=1")
 
 	// Set process group so cancelling terminates all child processes (bash, ffmpeg, scripts)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process != nil && cmd.Process.Pid > 0 {
-			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		}
-		return nil
-	}
+	setupProcessGroup(cmd)
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
